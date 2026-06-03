@@ -70,7 +70,7 @@ def extract_archive():
             zf.extractall(EXTRACT_DIR)
     elif magic.startswith("1f8b"):
         log("  Detected tar.gz")
-        subprocess.run(["tar", "xzf", ARCHIVE_PATH, "-C", EXTRACT_DIR], check=True)
+        subprocess.run(["tar", "xzf", ARCHIVE_PATH, "-C", EXTRACT_DIR, "--no-same-owner"], check=True)
     else:
         raise RuntimeError(f"Unknown archive type (magic={magic})")
 
