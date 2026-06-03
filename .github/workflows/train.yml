@@ -1,0 +1,68 @@
+name: Train & Release Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v1.0)"
+        required: true
+      epochs:
+        description: "Override epochs (leave empty to use training_config.yml)"
+        required: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read training config
+        id: config
+        run: |
+          pip install pyyaml -q
+          python3 - <<'EOF'
+          import yaml, os
+          cfg = yaml.safe_load(open("training_config.yml"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"dataset_url={cfg['dataset_url']}\n")
+              f.write(f"epochs={cfg['epochs']}\n")
+              f.write(f"base_model={cfg['base_model']}\n")
+              f.write(f"imgsz={cfg['imgsz']}\n")
+              f.write(f"batch={cfg['batch']}\n")
+              f.write(f"patience={cfg['patience']}\n")
+          EOF
+
+      - name: Submit training job to RunPod
+        run: |
+          EPOCHS="${{ inputs.epochs || steps.config.outputs.epochs }}"
+
+          RESPONSE=$(curl -s -X POST "https://api.runpod.ai/v2/${{ secrets.RUNPOD_ENDPOINT_ID }}/run" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -d "{
+              \"input\": {
+                \"dataset_url\":  \"${{ steps.config.outputs.dataset_url }}\",
+                \"epochs\":       $EPOCHS,
+                \"base_model\":   \"${{ steps.config.outputs.base_model }}\",
+                \"imgsz\":        ${{ steps.config.outputs.imgsz }},
+                \"batch\":        ${{ steps.config.outputs.batch }},
+                \"patience\":     ${{ steps.config.outputs.patience }},
+                \"release_tag\":  \"${{ inputs.release_tag }}\",
+                \"github_token\": \"${{ secrets.RELEASE_TOKEN }}\",
+                \"repo\":         \"${{ github.repository }}\"
+              }
+            }")
+
+          echo "RunPod response: $RESPONSE"
+
+          # Fail the action if no job id was returned
+          echo "$RESPONSE" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          if 'id' not in d:
+              print(f'ERROR: job not accepted — {d}')
+              sys.exit(1)
+          print(f'Job submitted successfully. ID: {d[\"id\"]}  Status: {d[\"status\"]}')
+          print('RunPod will train the model and create the GitHub release when done.')
+          "
