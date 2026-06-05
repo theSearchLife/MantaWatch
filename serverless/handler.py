@@ -117,7 +117,7 @@ def last_metrics(run_name: str) -> str:
 
 
 def create_github_release(model_path: str, token: str, repo: str, tag: str) -> str:
-    """Create a GitHub release and upload best.pt. Returns download URL."""
+    """Create (or overwrite) a GitHub release and upload model.pt. Returns download URL."""
     import requests
 
     headers = {
@@ -125,10 +125,19 @@ def create_github_release(model_path: str, token: str, repo: str, tag: str) -> s
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    base = f"https://api.github.com/repos/{repo}"
+
+    # Delete existing release + tag if present
+    existing = requests.get(f"{base}/releases/tags/{tag}", headers=headers, timeout=10)
+    if existing.status_code == 200:
+        release_id = existing.json()["id"]
+        requests.delete(f"{base}/releases/{release_id}", headers=headers, timeout=10)
+        requests.delete(f"{base}/git/refs/tags/{tag}", headers=headers, timeout=10)
+        log(f"  Deleted existing release {tag}")
 
     # Create release
     resp = requests.post(
-        f"https://api.github.com/repos/{repo}/releases",
+        f"{base}/releases",
         headers=headers,
         json={
             "tag_name": tag,
@@ -142,10 +151,10 @@ def create_github_release(model_path: str, token: str, repo: str, tag: str) -> s
     resp.raise_for_status()
     upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
 
-    # Upload model
+    # Upload model as model.pt
     with open(model_path, "rb") as f:
         up = requests.post(
-            f"{upload_url}?name=best.pt",
+            f"{upload_url}?name=model.pt",
             headers={**headers, "Content-Type": "application/octet-stream"},
             data=f,
             timeout=120,

@@ -1,7 +1,5 @@
-# Training hyperparameters and dataset configuration.
-# Update dataset_url here when the dataset changes — no code changes needed.
-
-dataset_url: "https://drive.google.com/uc?id=1SfFNtGMKP0dkqEqLAQNJT76_vP7LVwkC"
+# Training hyperparameters.
+# Dataset URL is configured as a GitHub variable (DATASET_URL).
 
 base_model: "yolo11s-cls.pt"
 epochs: 100
