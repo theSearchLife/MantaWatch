@@ -29,31 +29,41 @@ jobs:
               f.write(f"patience={cfg['patience']}\n")
           EOF
 
-      - name: Submit and wait for training job
+      - name: Submit and stream training job
         timeout-minutes: 360
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
+          RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          DATASET_URL: ${{ vars.DATASET_URL }}
+          REPO: ${{ github.repository }}
+          EPOCHS: ${{ steps.config.outputs.epochs }}
+          BASE_MODEL: ${{ steps.config.outputs.base_model }}
+          IMGSZ: ${{ steps.config.outputs.imgsz }}
+          BATCH: ${{ steps.config.outputs.batch }}
+          PATIENCE: ${{ steps.config.outputs.patience }}
         run: |
           RELEASE_TAG=$(date +%Y-%m-%d)
-          ENDPOINT="https://api.runpod.ai/v2/${{ secrets.RUNPOD_ENDPOINT_ID }}"
 
           # Submit job
-          RESPONSE=$(curl -s -X POST "$ENDPOINT/run" \
+          RESPONSE=$(curl -s -X POST "https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/run" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
             -d "{
               \"input\": {
-                \"dataset_url\":  \"${{ vars.DATASET_URL }}\",
-                \"epochs\":       ${{ steps.config.outputs.epochs }},
-                \"base_model\":   \"${{ steps.config.outputs.base_model }}\",
-                \"imgsz\":        ${{ steps.config.outputs.imgsz }},
-                \"batch\":        ${{ steps.config.outputs.batch }},
-                \"patience\":     ${{ steps.config.outputs.patience }},
-                \"release_tag\":  \"$RELEASE_TAG\",
-                \"github_token\": \"${{ secrets.RELEASE_GITHUB_TOKEN }}\",
-                \"repo\":         \"${{ github.repository }}\"
+                \"dataset_url\":  \"${DATASET_URL}\",
+                \"epochs\":       ${EPOCHS},
+                \"base_model\":   \"${BASE_MODEL}\",
+                \"imgsz\":        ${IMGSZ},
+                \"batch\":        ${BATCH},
+                \"patience\":     ${PATIENCE},
+                \"release_tag\":  \"${RELEASE_TAG}\",
+                \"github_token\": \"${RELEASE_GITHUB_TOKEN}\",
+                \"repo\":         \"${REPO}\"
               }
             }")
 
-          JOB_ID=$(echo "$RESPONSE" | python3 -c "
+          export JOB_ID=$(echo "$RESPONSE" | python3 -c "
           import json, sys
           d = json.load(sys.stdin)
           if 'id' not in d:
@@ -63,51 +73,5 @@ jobs:
           ")
           echo "Job submitted — ID: $JOB_ID"
 
-          # Poll until terminal state
-          while true; do
-            POLL=$(curl -s "$ENDPOINT/status/$JOB_ID" \
-              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}")
-
-            STATUS=$(echo "$POLL" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','UNKNOWN'))")
-
-            case "$STATUS" in
-              IN_QUEUE)
-                echo "⏳ In queue..."
-                ;;
-              IN_PROGRESS|RUNNING)
-                echo "🔄 Training in progress..."
-                ;;
-              COMPLETED)
-                echo "✅ Training completed successfully."
-                echo "$POLL" | python3 -c "
-          import json, sys
-          out = json.load(sys.stdin).get('output', {})
-          print(f'  Model size : {out.get(\"model_size_mb\", \"—\")} MB')
-          print(f'  Release    : {out.get(\"release_url\", \"—\")}')
-          "
-                break
-                ;;
-              FAILED)
-                echo "❌ Training failed."
-                echo "$POLL" | python3 -c "
-          import json, sys
-          d = json.load(sys.stdin)
-          print(d.get('error') or d.get('output') or d)
-          "
-                exit 1
-                ;;
-              TIMED_OUT)
-                echo "⏱️ Job timed out on RunPod (increase Execution Timeout in endpoint settings)."
-                exit 1
-                ;;
-              CANCELLED)
-                echo "🚫 Job was cancelled."
-                exit 1
-                ;;
-              *)
-                echo "Unknown status: $STATUS — continuing to poll..."
-                ;;
-            esac
-
-            sleep 60
-          done
+          # Stream epoch-level progress via /stream endpoint
+          python3 -u .github/scripts/stream_poll.py
