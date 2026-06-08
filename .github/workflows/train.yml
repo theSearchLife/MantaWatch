@@ -29,11 +29,14 @@ jobs:
               f.write(f"patience={cfg['patience']}\n")
           EOF
 
-      - name: Submit training job to RunPod
+      - name: Submit and wait for training job
+        timeout-minutes: 360
         run: |
           RELEASE_TAG=$(date +%Y-%m-%d)
+          ENDPOINT="https://api.runpod.ai/v2/${{ secrets.RUNPOD_ENDPOINT_ID }}"
 
-          RESPONSE=$(curl -s -X POST "https://api.runpod.ai/v2/${{ secrets.RUNPOD_ENDPOINT_ID }}/run" \
+          # Submit job
+          RESPONSE=$(curl -s -X POST "$ENDPOINT/run" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
             -d "{
@@ -50,14 +53,61 @@ jobs:
               }
             }")
 
-          echo "RunPod response: $RESPONSE"
-
-          echo "$RESPONSE" | python3 -c "
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "
           import json, sys
           d = json.load(sys.stdin)
           if 'id' not in d:
-              print(f'ERROR: job not accepted — {d}')
+              print(f'ERROR: job not accepted — {d}', file=sys.stderr)
               sys.exit(1)
-          print(f'Job submitted. ID: {d[\"id\"]}  Status: {d[\"status\"]}')
-          print('RunPod will train the model and create the GitHub release when done.')
+          print(d['id'])
+          ")
+          echo "Job submitted — ID: $JOB_ID"
+
+          # Poll until terminal state
+          while true; do
+            POLL=$(curl -s "$ENDPOINT/status/$JOB_ID" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}")
+
+            STATUS=$(echo "$POLL" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','UNKNOWN'))")
+
+            case "$STATUS" in
+              IN_QUEUE)
+                echo "⏳ In queue..."
+                ;;
+              IN_PROGRESS|RUNNING)
+                echo "🔄 Training in progress..."
+                ;;
+              COMPLETED)
+                echo "✅ Training completed successfully."
+                echo "$POLL" | python3 -c "
+          import json, sys
+          out = json.load(sys.stdin).get('output', {})
+          print(f'  Model size : {out.get(\"model_size_mb\", \"—\")} MB')
+          print(f'  Release    : {out.get(\"release_url\", \"—\")}')
           "
+                break
+                ;;
+              FAILED)
+                echo "❌ Training failed."
+                echo "$POLL" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          print(d.get('error') or d.get('output') or d)
+          "
+                exit 1
+                ;;
+              TIMED_OUT)
+                echo "⏱️ Job timed out on RunPod (increase Execution Timeout in endpoint settings)."
+                exit 1
+                ;;
+              CANCELLED)
+                echo "🚫 Job was cancelled."
+                exit 1
+                ;;
+              *)
+                echo "Unknown status: $STATUS — continuing to poll..."
+                ;;
+            esac
+
+            sleep 60
+          done
