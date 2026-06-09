@@ -49,6 +49,8 @@ def print_item(out: dict):
         print(f"[{ts()}] 📦 Extracting archive...", flush=True)
     elif s == "releasing":
         print(f"[{ts()}] 🚀 Creating GitHub release...", flush=True)
+    elif s == "evaluating":
+        print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
     elif s not in ("done", ""):
         print(f"[{ts()}] {out}", flush=True)
 
@@ -87,6 +89,8 @@ def main():
             print(f"[{ts()}] ✅ Training completed successfully.", flush=True)
             print(f"  Model size : {final.get('model_size_mb', '—')} MB", flush=True)
             print(f"  Release    : {final.get('release_url', '—')}", flush=True)
+            if final.get("report_url"):
+                print(f"  Report     : {final.get('report_url')}", flush=True)
             sys.exit(0)
 
         elif status == "FAILED":
