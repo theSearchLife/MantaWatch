@@ -83,6 +83,41 @@ def _extract(archive: str, dest: str):
         raise RuntimeError(f"Unknown archive type (magic={magic})")
 
 
+def _stream_extract(url: str, dest: str):
+    """Stream-extract a tar.gz from a URL directly — no archive stored locally.
+    Halves peak disk usage vs download-then-extract (critical for large eval datasets).
+    For Google Drive, uses drive.usercontent.google.com to bypass the virus-scan page.
+    """
+    import requests
+    import tarfile as tf_lib
+
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+    os.makedirs(dest)
+
+    if "drive.google.com" in url or "drive.usercontent.google.com" in url:
+        m = re.search(r"(?:id=|/d/)([a-zA-Z0-9_-]{20,})", url)
+        if not m:
+            raise ValueError(f"Cannot parse Google Drive file ID from: {url}")
+        file_id = m.group(1)
+        stream_url = (
+            f"https://drive.usercontent.google.com/download"
+            f"?id={file_id}&export=download&confirm=t"
+        )
+        log(f"  Google Drive ID: {file_id}")
+    else:
+        stream_url = url
+
+    log(f"  Streaming → extraction (archive will not be stored)...")
+    resp = requests.get(stream_url, stream=True, timeout=120)
+    resp.raise_for_status()
+    resp.raw.decode_content = True  # handle HTTP-level Content-Encoding
+
+    with tf_lib.open(fileobj=resp.raw, mode="r|gz") as tar:
+        tar.extractall(dest)
+    log(f"  Streamed and extracted to: {dest}")
+
+
 def find_train_root(extract_dir: str) -> str:
     result = subprocess.run(
         ["find", extract_dir, "-maxdepth", "3", "-type", "d", "-name", "train"],
@@ -550,19 +585,34 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
 # GitHub Pages publishing
 
 def _ensure_gh_pages_branch(headers: dict, base: str):
+    """Create gh-pages branch if it doesn't exist, branching off main.
+    Requires Contents:write permission on the token.
+    """
     import requests
     check = requests.get(f"{base}/git/refs/heads/gh-pages", headers=headers, timeout=10)
     if check.status_code == 200:
+        log("  gh-pages branch already exists.")
         return
-    log("  Creating orphan gh-pages branch...")
-    tree   = requests.post(f"{base}/git/trees",   headers=headers, json={"tree": []}, timeout=10)
-    tree.raise_for_status()
-    commit = requests.post(f"{base}/git/commits", headers=headers,
-                           json={"message": "Initialize gh-pages", "tree": tree.json()["sha"]}, timeout=10)
-    commit.raise_for_status()
-    ref = requests.post(f"{base}/git/refs", headers=headers,
-                        json={"ref": "refs/heads/gh-pages", "sha": commit.json()["sha"]}, timeout=10)
-    ref.raise_for_status()
+    log(f"  gh-pages not found (HTTP {check.status_code}) — creating from main...")
+    main_ref = requests.get(f"{base}/git/refs/heads/main", headers=headers, timeout=10)
+    if main_ref.status_code != 200:
+        raise RuntimeError(
+            f"Cannot read main branch ref: HTTP {main_ref.status_code} — "
+            "check that RELEASE_GITHUB_TOKEN has Contents:write permission. "
+            f"Response: {main_ref.text[:300]}"
+        )
+    main_sha = main_ref.json()["object"]["sha"]
+    log(f"  Branching gh-pages from main ({main_sha[:7]})...")
+    ref = requests.post(
+        f"{base}/git/refs", headers=headers,
+        json={"ref": "refs/heads/gh-pages", "sha": main_sha}, timeout=15,
+    )
+    if ref.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Cannot create gh-pages ref: HTTP {ref.status_code} — "
+            "check that RELEASE_GITHUB_TOKEN has Contents:write permission. "
+            f"Response: {ref.text[:300]}"
+        )
     log("  gh-pages branch created.")
 
 
@@ -641,6 +691,18 @@ def handler(job: dict):
         release_url = None
         report_url  = None
 
+        # Free disk space: training artifacts no longer needed after training
+        log("==> Cleaning up training artifacts to free disk space...")
+        for _p in [TRAIN_ARCHIVE, TRAIN_DIR]:
+            try:
+                if os.path.isdir(_p):
+                    shutil.rmtree(_p)
+                elif os.path.exists(_p):
+                    os.remove(_p)
+                log(f"  Removed {_p}")
+            except Exception as _e:
+                log(f"  Warning: could not remove {_p}: {_e}")
+
         if release_tag and github_token and repo:
             yield {"status": "releasing", "tag": release_tag}
             log(f"==> Creating GitHub release {release_tag}...")
@@ -649,9 +711,8 @@ def handler(job: dict):
 
             if eval_dataset_url:
                 yield {"status": "evaluating"}
-                log("==> Downloading eval dataset...")
-                _download(eval_dataset_url, EVAL_ARCHIVE)
-                _extract(EVAL_ARCHIVE, EVAL_DIR)
+                log("==> Downloading & extracting eval dataset (streaming)...")
+                _stream_extract(eval_dataset_url, EVAL_DIR)
                 eval_root = find_eval_root(EVAL_DIR)
 
                 log("==> Evaluating new model...")
@@ -664,9 +725,15 @@ def handler(job: dict):
                     prev_eval = run_full_eval(prev_path, eval_root)
 
                 log("==> Generating and publishing report...")
-                html       = generate_report_html(new_eval, prev_eval, release_tag, prev_tag)
-                report_url = publish_to_gh_pages(html, github_token, repo, release_tag)
-                log(f"  Report: {report_url}")
+                try:
+                    html       = generate_report_html(new_eval, prev_eval, release_tag, prev_tag)
+                    report_url = publish_to_gh_pages(html, github_token, repo, release_tag)
+                    log(f"  Report: {report_url}")
+                except Exception as pub_exc:
+                    import traceback
+                    log(f"  WARNING: publish_to_gh_pages failed — {pub_exc}")
+                    log(traceback.format_exc())
+                    log("  Check that RELEASE_GITHUB_TOKEN has Contents:write permission.")
             else:
                 log("  No eval_dataset_url — skipping evaluation report")
         else:
