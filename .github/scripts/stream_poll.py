@@ -80,12 +80,23 @@ def main():
             print(f"[{ts()}] ⏳ In queue...", flush=True)
 
         elif status == "COMPLETED":
-            final = next(
-                (item.get("output", {}) for item in items
-                 if isinstance(item.get("output"), dict)
-                 and item["output"].get("status") == "done"),
-                {},
-            )
+            # When COMPLETED, RunPod may move items out of 'stream' into 'output'.
+            # 'output' can be: the last yielded dict, a list of all items, or None.
+            output_field = data.get("output")
+            final = {}
+
+            if isinstance(output_field, dict) and output_field.get("status") == "done":
+                # output is directly the last yielded value
+                final = output_field
+            else:
+                # search through stream items (in_progress) or output list (completed)
+                search = items or (output_field if isinstance(output_field, list) else [])
+                for candidate in search:
+                    out = candidate.get("output", candidate) if isinstance(candidate, dict) else {}
+                    if isinstance(out, dict) and out.get("status") == "done":
+                        final = out
+                        break
+
             print(f"[{ts()}] ✅ Training completed successfully.", flush=True)
             print(f"  Model size : {final.get('model_size_mb', '—')} MB", flush=True)
             print(f"  Release    : {final.get('release_url', '—')}", flush=True)
