@@ -36,6 +36,7 @@ jobs:
           RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
           RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           DATASET_URL: ${{ vars.DATASET_URL }}
+          EVAL_DATASET_URL: ${{ vars.EVAL_DATASET_URL }}
           REPO: ${{ github.repository }}
           EPOCHS: ${{ steps.config.outputs.epochs }}
           BASE_MODEL: ${{ steps.config.outputs.base_model }}
@@ -51,15 +52,16 @@ jobs:
             -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
             -d "{
               \"input\": {
-                \"dataset_url\":  \"${DATASET_URL}\",
-                \"epochs\":       ${EPOCHS},
-                \"base_model\":   \"${BASE_MODEL}\",
-                \"imgsz\":        ${IMGSZ},
-                \"batch\":        ${BATCH},
-                \"patience\":     ${PATIENCE},
-                \"release_tag\":  \"${RELEASE_TAG}\",
-                \"github_token\": \"${RELEASE_GITHUB_TOKEN}\",
-                \"repo\":         \"${REPO}\"
+                \"dataset_url\":      \"${DATASET_URL}\",
+                \"eval_dataset_url\": \"${EVAL_DATASET_URL}\",
+                \"epochs\":           ${EPOCHS},
+                \"base_model\":       \"${BASE_MODEL}\",
+                \"imgsz\":            ${IMGSZ},
+                \"batch\":            ${BATCH},
+                \"patience\":         ${PATIENCE},
+                \"release_tag\":      \"${RELEASE_TAG}\",
+                \"github_token\":     \"${RELEASE_GITHUB_TOKEN}\",
+                \"repo\":             \"${REPO}\"
               }
             }")
 
