@@ -36,21 +36,18 @@ import matplotlib.pyplot as plt
 import runpod
 
 DEFAULT_DATASET_URL = "https://drive.google.com/uc?id=1SfFNtGMKP0dkqEqLAQNJT76_vP7LVwkC"
-PROGRESS_INTERVAL   = 5  # yield progress every N epochs
+PROGRESS_INTERVAL = 5
 
 TRAIN_ARCHIVE = "/tmp/dataset_train.archive"
-EVAL_ARCHIVE  = "/tmp/dataset_eval.archive"
-TRAIN_DIR     = "/tmp/dataset_train"
-EVAL_DIR      = "/tmp/dataset_eval"
-PREV_MODEL    = "/tmp/model_prev.pt"
-RUNS_DIR      = "/tmp/runs"
+TRAIN_DIR = "/tmp/dataset_train"
+EVAL_DIR = "/tmp/dataset_eval"
+PREV_MODEL = "/tmp/model_prev.pt"
+RUNS_DIR = "/tmp/runs"
 
 
 def log(msg: str):
     print(msg, flush=True)
 
-
-# Archive helpers
 
 def _download(url: str, dest: str):
     if os.path.exists(dest):
@@ -83,12 +80,105 @@ def _extract(archive: str, dest: str):
         raise RuntimeError(f"Unknown archive type (magic={magic})")
 
 
-def _stream_extract(url: str, dest: str):
-    """Stream-extract a tar.gz from URL without storing the archive locally.
-    Google Drive: gdown subprocess → /dev/stdout → tarfile (handles auth/confirmation).
-    Direct URLs: requests streaming → tarfile.
-    Halves peak disk vs download-then-extract.
+def _gdrive_get_stream(file_id: str):
+    """Return a streaming requests.Response for a Google Drive file.
+
+    Tries four strategies in order: direct usercontent shortcut, confirmation
+    form (includes UUID token required since 2023), embedded download URL, and
+    download_warning cookie.
     """
+    import requests
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+
+    shortcut = (
+        f"https://drive.usercontent.google.com/download"
+        f"?id={file_id}&export=download&confirm=t"
+    )
+    r = session.get(shortcut, stream=True, timeout=30)
+    if r.status_code == 200 and "text/html" not in r.headers.get("content-type", "").lower():
+        log("  GDrive: streaming via drive.usercontent")
+        return r
+    r.close()
+
+    r = session.get(
+        "https://drive.google.com/uc",
+        params={"id": file_id, "export": "download"},
+        timeout=30,
+    )
+    if "Content-Disposition" in r.headers:
+        log("  GDrive: streaming directly (small file)")
+        return session.get(
+            "https://drive.google.com/uc",
+            params={"id": file_id, "export": "download"},
+            stream=True,
+            timeout=120,
+        )
+
+    html = r.text
+
+    form_m = re.search(
+        r'<form[^>]+action="(https://drive\.usercontent\.google\.com/download[^"]*)"',
+        html,
+    ) or re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', html)
+    if form_m:
+        action = form_m.group(1).replace("&amp;", "&")
+        params = {}
+        for m in re.finditer(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', html):
+            params[m.group(1)] = m.group(2).replace("&amp;", "&")
+        if params:
+            log(f"  GDrive: streaming via confirmation form (uuid={params.get('uuid', '?')[:8]}...)")
+            resp = session.get(action, params=params, stream=True, timeout=120)
+            resp.raise_for_status()
+            return resp
+
+    for pattern in [
+        r'"downloadUrl"\s*:\s*"([^"]+)"',
+        r'href="(https://drive\.usercontent\.google\.com/download[^"]+)"',
+        r'href="(/uc\?export=download[^"]+)"',
+    ]:
+        m_url = re.search(pattern, html)
+        if m_url:
+            dl_url = (
+                m_url.group(1)
+                .replace("\\u003d", "=")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
+            )
+            if not dl_url.startswith("http"):
+                dl_url = "https://docs.google.com" + dl_url
+            log("  GDrive: streaming via embedded URL")
+            resp = session.get(dl_url, stream=True, timeout=120)
+            resp.raise_for_status()
+            return resp
+
+    confirm = session.cookies.get("download_warning")
+    if confirm:
+        log("  GDrive: streaming via download_warning cookie")
+        resp = session.get(
+            "https://drive.google.com/uc",
+            params={"id": file_id, "export": "download", "confirm": confirm},
+            stream=True,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp
+
+    raise RuntimeError(
+        f"All Google Drive download strategies failed for file {file_id}. "
+        "Host the eval dataset on a direct URL (S3, GitHub Releases) for reliable operation."
+    )
+
+
+def _stream_extract(url: str, dest: str):
+    """Stream-extract a tar.gz from URL without storing the archive locally."""
+    import requests
     import tarfile as tf_lib
 
     if os.path.exists(dest):
@@ -101,33 +191,15 @@ def _stream_extract(url: str, dest: str):
             raise ValueError(f"Cannot parse Google Drive file ID from: {url}")
         file_id = m.group(1)
         log(f"  Google Drive ID: {file_id}")
-        log("  Streaming via gdown → /dev/stdout → tar (no archive stored)...")
-        # gdown writes file bytes to /dev/stdout; parent reads via stdout pipe into tarfile
-        proc = subprocess.Popen(
-            ["gdown", file_id, "-O", "/dev/stdout", "--quiet"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            with tf_lib.open(fileobj=proc.stdout, mode="r|gz") as tar:
-                tar.extractall(dest)
-        finally:
-            stderr_bytes = proc.stderr.read()
-            proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"gdown failed (exit {proc.returncode}): "
-                f"{stderr_bytes.decode(errors='replace')[:500]}"
-            )
+        resp = _gdrive_get_stream(file_id)
     else:
-        import requests
-        log("  Streaming direct URL (no archive stored)...")
+        log("  Streaming direct URL...")
         resp = requests.get(url, stream=True, timeout=120)
         resp.raise_for_status()
-        resp.raw.decode_content = True
-        with tf_lib.open(fileobj=resp.raw, mode="r|gz") as tar:
-            tar.extractall(dest)
 
+    resp.raw.decode_content = True
+    with tf_lib.open(fileobj=resp.raw, mode="r|gz") as tar:
+        tar.extractall(dest)
     log(f"  Streamed and extracted to: {dest}")
 
 
@@ -179,15 +251,13 @@ def find_eval_root(extract_dir: str) -> str:
     return extract_dir
 
 
-# Training
-
 def _train_with_progress(dataset_root, run_name, base_model, epochs, imgsz, batch, patience):
-    """Generator: YOLO trains in a background thread, yields epoch dicts every PROGRESS_INTERVAL epochs.
-    Return value (via StopIteration) is the path to best.pt.
-    Usage: best_pt = yield from _train_with_progress(...)
+    """Train in a background thread, yielding epoch progress dicts.
+
+    Returns the path to best.pt via StopIteration (use `yield from`).
     """
-    progress_q    = queue.Queue()
-    error_holder  = [None]
+    progress_q = queue.Queue()
+    error_holder = [None]
     result_holder = [None]
 
     def on_epoch_end(trainer):
@@ -248,8 +318,6 @@ def last_metrics(run_name: str) -> str:
     return ""
 
 
-# GitHub helpers
-
 def _gh_headers(token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
@@ -261,12 +329,12 @@ def _gh_headers(token: str) -> dict:
 def create_github_release(model_path: str, token: str, repo: str, tag: str) -> str:
     import requests
     headers = _gh_headers(token)
-    base    = f"https://api.github.com/repos/{repo}"
+    base = f"https://api.github.com/repos/{repo}"
     existing = requests.get(f"{base}/releases/tags/{tag}", headers=headers, timeout=10)
     if existing.status_code == 200:
         release_id = existing.json()["id"]
         requests.delete(f"{base}/releases/{release_id}", headers=headers, timeout=10)
-        requests.delete(f"{base}/git/refs/tags/{tag}",  headers=headers, timeout=10)
+        requests.delete(f"{base}/git/refs/tags/{tag}", headers=headers, timeout=10)
         log(f"  Deleted existing release {tag}")
     resp = requests.post(
         f"{base}/releases", headers=headers,
@@ -316,8 +384,6 @@ def get_previous_model(token: str, repo: str, current_tag: str):
     log("  No previous release found")
     return (None, None)
 
-
-# Evaluation
 
 def _fig_to_b64(fig) -> str:
     import io
@@ -405,8 +471,8 @@ def run_full_eval(model_path: str, eval_root: str) -> dict:
     from sklearn.preprocessing import label_binarize
     from ultralytics import YOLO
 
-    model    = YOLO(model_path)
-    classes  = list(model.names.values())
+    model = YOLO(model_path)
+    classes = list(model.names.values())
     name2idx = {v: k for k, v in model.names.items()}
 
     IMG_EXTS = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
@@ -433,32 +499,33 @@ def run_full_eval(model_path: str, eval_root: str) -> dict:
     if n_skip:
         log(f"  Skipped {n_skip} corrupt image(s)")
 
+    eval_chunk = 100
     pred_labels, pred_probs = [], []
-    for result in model.predict(
-        source=[str(p) for p in valid_paths], imgsz=640, verbose=False, stream=True,
-    ):
-        probs   = result.probs.data.cpu().numpy()
-        top_idx = int(np.argmax(probs))
-        pred_labels.append(model.names[top_idx])
-        pred_probs.append(probs)
+    for start in range(0, len(valid_paths), eval_chunk):
+        chunk = [str(p) for p in valid_paths[start:start + eval_chunk]]
+        for result in model.predict(source=chunk, imgsz=640, verbose=False, stream=True):
+            probs = result.probs.data.cpu().numpy()
+            top_idx = int(np.argmax(probs))
+            pred_labels.append(model.names[top_idx])
+            pred_probs.append(probs)
 
     probs_arr = np.stack(pred_probs)
-    y_true    = np.array(valid_labels)
-    y_pred    = np.array(pred_labels)
+    y_true = np.array(valid_labels)
+    y_pred = np.array(pred_labels)
 
     accuracy = round(float(accuracy_score(y_true, y_pred)) * 100, 2)
     prec_arr = precision_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
-    rec_arr  = recall_score  (y_true, y_pred, labels=classes, average=None, zero_division=0)
-    f1_arr   = f1_score      (y_true, y_pred, labels=classes, average=None, zero_division=0)
+    rec_arr = recall_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
+    f1_arr = f1_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
 
-    y_bin   = label_binarize(y_true, classes=classes)
+    y_bin = label_binarize(y_true, classes=classes)
     y_score = np.stack([probs_arr[:, name2idx[c]] for c in classes], axis=1)
 
     auc_per, fpr_tpr = {}, {}
     for i, cls in enumerate(classes):
         try:
             auc_per[cls] = round(float(roc_auc_score(y_bin[:, i], y_score[:, i])), 4)
-            fpr, tpr, _  = roc_curve(y_bin[:, i], y_score[:, i])
+            fpr, tpr, _ = roc_curve(y_bin[:, i], y_score[:, i])
             fpr_tpr[cls] = (fpr.tolist(), tpr.tolist())
         except Exception:
             auc_per[cls] = None
@@ -466,10 +533,10 @@ def run_full_eval(model_path: str, eval_root: str) -> dict:
     per_class = {
         cls: {
             "precision": round(float(prec_arr[i]) * 100, 2),
-            "recall":    round(float(rec_arr[i])  * 100, 2),
-            "f1":        round(float(f1_arr[i])   * 100, 2),
-            "auc":       auc_per.get(cls),
-            "support":   int((y_true == cls).sum()),
+            "recall": round(float(rec_arr[i]) * 100, 2),
+            "f1": round(float(f1_arr[i]) * 100, 2),
+            "auc": auc_per.get(cls),
+            "support": int((y_true == cls).sum()),
         }
         for i, cls in enumerate(classes)
     }
@@ -483,20 +550,18 @@ def run_full_eval(model_path: str, eval_root: str) -> dict:
     log(f"  Accuracy: {accuracy}%  errors: {len(errors)}/{len(valid_paths)}")
 
     return {
-        "accuracy":  accuracy,
+        "accuracy": accuracy,
         "per_class": per_class,
-        "classes":   classes,
-        "total":     len(valid_paths),
-        "n_errors":  len(errors),
-        "cm":        cm,
-        "fpr_tpr":   fpr_tpr,
-        "auc_per":   auc_per,
-        "errors":    errors,
-        "name2idx":  name2idx,
+        "classes": classes,
+        "total": len(valid_paths),
+        "n_errors": len(errors),
+        "cm": cm,
+        "fpr_tpr": fpr_tpr,
+        "auc_per": auc_per,
+        "errors": errors,
+        "name2idx": name2idx,
     }
 
-
-# Report generation
 
 def _delta_fmt(new_val, prev_val):
     if prev_val is None or new_val is None:
@@ -510,14 +575,14 @@ def _delta_fmt(new_val, prev_val):
 
 
 def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> str:
-    now        = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     prev_label = prev_tag or "—"
-    classes    = new_eval["classes"]
+    classes = new_eval["classes"]
 
     def metric_row(label, new_val, prev_val):
         d_str, d_col = _delta_fmt(new_val, prev_val)
         prev_str = f"{prev_val:.2f}" if prev_val is not None else "—"
-        nv_str   = f"{new_val:.2f}" if new_val is not None else "—"
+        nv_str = f"{new_val:.2f}" if new_val is not None else "—"
         return (
             f"<tr><td>{label}</td><td><b>{nv_str}</b></td>"
             f"<td>{prev_str}</td>"
@@ -549,12 +614,16 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
       <tbody>{rows}</tbody>
     </table>"""
 
-    new_cm_b64  = _plot_confusion_matrix(new_eval["cm"],  classes, f"New — {new_tag}")
-    prev_cm_b64 = (_plot_confusion_matrix(prev_eval["cm"], classes, f"Prev — {prev_label}")
-                   if prev_eval else None)
-    new_roc_b64  = _plot_roc_curves(new_eval["fpr_tpr"],  new_eval["auc_per"],  classes, f"New — {new_tag}")
-    prev_roc_b64 = (_plot_roc_curves(prev_eval["fpr_tpr"], prev_eval["auc_per"], classes, f"Prev — {prev_label}")
-                    if prev_eval else None)
+    new_cm_b64 = _plot_confusion_matrix(new_eval["cm"], classes, f"New — {new_tag}")
+    prev_cm_b64 = (
+        _plot_confusion_matrix(prev_eval["cm"], classes, f"Prev — {prev_label}")
+        if prev_eval else None
+    )
+    new_roc_b64 = _plot_roc_curves(new_eval["fpr_tpr"], new_eval["auc_per"], classes, f"New — {new_tag}")
+    prev_roc_b64 = (
+        _plot_roc_curves(prev_eval["fpr_tpr"], prev_eval["auc_per"], classes, f"Prev — {prev_label}")
+        if prev_eval else None
+    )
     err_b64 = _plot_error_grid(new_eval["errors"][:12], new_eval["name2idx"])
 
     def chart_pair(new_b64, prev_b64, title):
@@ -617,8 +686,6 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
 </html>"""
 
 
-# GitHub Pages publishing
-
 def _ensure_gh_pages_branch(headers: dict, base: str):
     """Create gh-pages branch if it doesn't exist, branching off main.
     Requires Contents:write permission on the token.
@@ -660,7 +727,7 @@ def _put_gh_pages_file(headers: dict, base: str, filename: str, content: str, me
     payload = {
         "message": message,
         "content": base64.b64encode(content.encode()).decode(),
-        "branch":  "gh-pages",
+        "branch": "gh-pages",
     }
     if sha:
         payload["sha"] = sha
@@ -670,7 +737,7 @@ def _put_gh_pages_file(headers: dict, base: str, filename: str, content: str, me
 
 def publish_to_gh_pages(html: str, token: str, repo: str, tag: str) -> str:
     headers = _gh_headers(token)
-    base    = f"https://api.github.com/repos/{repo}"
+    base = f"https://api.github.com/repos/{repo}"
     _ensure_gh_pages_branch(headers, base)
     report_file = f"report-{tag}.html"
     _put_gh_pages_file(headers, base, report_file, html, f"Report: {tag}")
@@ -686,22 +753,20 @@ def publish_to_gh_pages(html: str, token: str, repo: str, tag: str) -> str:
     return f"https://{owner.lower()}.github.io/{reponame}/{report_file}"
 
 
-# RunPod handler (generator — enables /stream endpoint)
-
 def handler(job: dict):
     inp = job.get("input", {})
 
-    dataset_url      = inp.get("dataset_url",      DEFAULT_DATASET_URL)
+    dataset_url = inp.get("dataset_url", DEFAULT_DATASET_URL)
     eval_dataset_url = inp.get("eval_dataset_url")
-    epochs           = int(inp.get("epochs",   100))
-    base_model       = inp.get("base_model",   "yolo11s-cls.pt")
-    imgsz            = int(inp.get("imgsz",    640))
-    batch            = int(inp.get("batch",    32))
-    patience         = int(inp.get("patience", 20))
-    run_name         = inp.get("run_name") or f"run-{datetime.datetime.utcnow():%Y%m%d-%H%M%S}"
-    release_tag      = inp.get("release_tag")
-    github_token     = inp.get("github_token")
-    repo             = inp.get("repo")
+    epochs = int(inp.get("epochs", 100))
+    base_model = inp.get("base_model", "yolo11s-cls.pt")
+    imgsz = int(inp.get("imgsz", 640))
+    batch = int(inp.get("batch", 32))
+    patience = int(inp.get("patience", 20))
+    run_name = inp.get("run_name") or f"run-{datetime.datetime.utcnow():%Y%m%d-%H%M%S}"
+    release_tag = inp.get("release_tag")
+    github_token = inp.get("github_token")
+    repo = inp.get("repo")
 
     log(f"=== Job start: {run_name} ===")
 
@@ -724,22 +789,21 @@ def handler(job: dict):
         )
         log("==> Training complete.")
 
-        size_mb     = round(os.path.getsize(best_pt) / 1024 / 1024, 1)
+        size_mb = round(os.path.getsize(best_pt) / 1024 / 1024, 1)
         metrics_csv = last_metrics(run_name)
         release_url = None
-        report_url  = None
+        report_url = None
 
-        # Free disk space: training artifacts no longer needed after training
-        log("==> Cleaning up training artifacts to free disk space...")
-        for _p in [TRAIN_ARCHIVE, TRAIN_DIR]:
+        log("==> Cleaning up training artifacts...")
+        for path in [TRAIN_ARCHIVE, TRAIN_DIR]:
             try:
-                if os.path.isdir(_p):
-                    shutil.rmtree(_p)
-                elif os.path.exists(_p):
-                    os.remove(_p)
-                log(f"  Removed {_p}")
-            except Exception as _e:
-                log(f"  Warning: could not remove {_p}: {_e}")
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.exists(path):
+                    os.remove(path)
+                log(f"  Removed {path}")
+            except Exception as exc:
+                log(f"  Warning: could not remove {path}: {exc}")
 
         if release_tag and github_token and repo:
             yield {"status": "releasing", "tag": release_tag}
@@ -767,7 +831,7 @@ def handler(job: dict):
 
                 log("==> Generating and publishing report...")
                 try:
-                    html       = generate_report_html(new_eval, prev_eval, release_tag, prev_tag)
+                    html = generate_report_html(new_eval, prev_eval, release_tag, prev_tag)
                     report_url = publish_to_gh_pages(html, github_token, repo, release_tag)
                     log(f"  Report: {report_url}")
                 except Exception as pub_exc:
@@ -781,12 +845,12 @@ def handler(job: dict):
             log("  Skipping release and report (no tag/token/repo)")
 
         yield {
-            "status":            "done",
-            "run_name":          run_name,
-            "model_size_mb":     size_mb,
+            "status": "done",
+            "run_name": run_name,
+            "model_size_mb": size_mb,
             "metrics_last_line": metrics_csv,
-            "release_url":       release_url,
-            "report_url":        report_url,
+            "release_url": release_url,
+            "report_url": report_url,
         }
 
     except Exception as exc:
