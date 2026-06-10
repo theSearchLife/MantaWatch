@@ -84,11 +84,11 @@ def _extract(archive: str, dest: str):
 
 
 def _stream_extract(url: str, dest: str):
-    """Stream-extract a tar.gz from a URL directly — no archive stored locally.
-    Halves peak disk usage vs download-then-extract (critical for large eval datasets).
-    For Google Drive, uses drive.usercontent.google.com to bypass the virus-scan page.
+    """Stream-extract a tar.gz from URL without storing the archive locally.
+    Google Drive: gdown subprocess → /dev/stdout → tarfile (handles auth/confirmation).
+    Direct URLs: requests streaming → tarfile.
+    Halves peak disk vs download-then-extract.
     """
-    import requests
     import tarfile as tf_lib
 
     if os.path.exists(dest):
@@ -100,35 +100,54 @@ def _stream_extract(url: str, dest: str):
         if not m:
             raise ValueError(f"Cannot parse Google Drive file ID from: {url}")
         file_id = m.group(1)
-        stream_url = (
-            f"https://drive.usercontent.google.com/download"
-            f"?id={file_id}&export=download&confirm=t"
-        )
         log(f"  Google Drive ID: {file_id}")
+        log("  Streaming via gdown → /dev/stdout → tar (no archive stored)...")
+        # gdown writes file bytes to /dev/stdout; parent reads via stdout pipe into tarfile
+        proc = subprocess.Popen(
+            ["gdown", file_id, "-O", "/dev/stdout", "--quiet"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            with tf_lib.open(fileobj=proc.stdout, mode="r|gz") as tar:
+                tar.extractall(dest)
+        finally:
+            stderr_bytes = proc.stderr.read()
+            proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"gdown failed (exit {proc.returncode}): "
+                f"{stderr_bytes.decode(errors='replace')[:500]}"
+            )
     else:
-        stream_url = url
+        import requests
+        log("  Streaming direct URL (no archive stored)...")
+        resp = requests.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+        resp.raw.decode_content = True
+        with tf_lib.open(fileobj=resp.raw, mode="r|gz") as tar:
+            tar.extractall(dest)
 
-    log(f"  Streaming → extraction (archive will not be stored)...")
-    resp = requests.get(stream_url, stream=True, timeout=120)
-    resp.raise_for_status()
-    resp.raw.decode_content = True  # handle HTTP-level Content-Encoding
-
-    with tf_lib.open(fileobj=resp.raw, mode="r|gz") as tar:
-        tar.extractall(dest)
     log(f"  Streamed and extracted to: {dest}")
 
 
 def _remove_corrupt_images(root: str) -> int:
-    """Delete corrupt images (PIL-unreadable) from a directory tree. Returns count."""
+    """Delete images unreadable by PIL or OpenCV (what YOLO uses). Returns count."""
     from PIL import Image as _PIL
+    import cv2 as _cv2
     IMG_EXTS = {'.jpg', '.jpeg', '.png'}
     removed = 0
     for p in pathlib.Path(root).rglob("*"):
         if p.suffix.lower() in IMG_EXTS:
+            bad = False
             try:
                 with _PIL.open(p) as img:
                     img.load()
             except Exception:
+                bad = True
+            if not bad and _cv2.imread(str(p)) is None:
+                bad = True
+            if bad:
                 p.unlink(missing_ok=True)
                 removed += 1
     return removed
