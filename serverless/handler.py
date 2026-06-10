@@ -118,6 +118,22 @@ def _stream_extract(url: str, dest: str):
     log(f"  Streamed and extracted to: {dest}")
 
 
+def _remove_corrupt_images(root: str) -> int:
+    """Delete corrupt images (PIL-unreadable) from a directory tree. Returns count."""
+    from PIL import Image as _PIL
+    IMG_EXTS = {'.jpg', '.jpeg', '.png'}
+    removed = 0
+    for p in pathlib.Path(root).rglob("*"):
+        if p.suffix.lower() in IMG_EXTS:
+            try:
+                with _PIL.open(p) as img:
+                    img.load()
+            except Exception:
+                p.unlink(missing_ok=True)
+                removed += 1
+    return removed
+
+
 def find_train_root(extract_dir: str) -> str:
     result = subprocess.run(
         ["find", extract_dir, "-maxdepth", "3", "-type", "d", "-name", "train"],
@@ -679,6 +695,9 @@ def handler(job: dict):
         log("==> Extracting...")
         _extract(TRAIN_ARCHIVE, TRAIN_DIR)
         dataset_root = find_train_root(TRAIN_DIR)
+        n_corrupt = _remove_corrupt_images(dataset_root)
+        if n_corrupt:
+            log(f"  Skipped {n_corrupt} corrupt training image(s)")
 
         log("==> Training...")
         best_pt = yield from _train_with_progress(
@@ -714,6 +733,9 @@ def handler(job: dict):
                 log("==> Downloading & extracting eval dataset (streaming)...")
                 _stream_extract(eval_dataset_url, EVAL_DIR)
                 eval_root = find_eval_root(EVAL_DIR)
+                n_corrupt = _remove_corrupt_images(eval_root)
+                if n_corrupt:
+                    log(f"  Removed {n_corrupt} corrupt eval image(s)")
 
                 log("==> Evaluating new model...")
                 new_eval = run_full_eval(best_pt, eval_root)
