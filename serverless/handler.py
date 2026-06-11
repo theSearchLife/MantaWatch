@@ -44,6 +44,10 @@ EVAL_DIR = "/tmp/dataset_eval"
 PREV_MODEL = "/tmp/model_prev.pt"
 RUNS_DIR = "/tmp/runs"
 
+INGEST_SHORT_SIDE = 640
+INGEST_JPEG_QUALITY = 90
+INGEST_THREADS = 8
+
 
 def log(msg: str):
     print(msg, flush=True)
@@ -176,53 +180,138 @@ def _gdrive_get_stream(file_id: str):
     )
 
 
-def _stream_extract(url: str, dest: str):
-    """Stream-extract a tar.gz from URL without storing the archive locally."""
+def _open_stream(url: str):
+    """Open a streaming HTTP response for a direct or Google Drive URL."""
     import requests
-    import tarfile as tf_lib
-
-    if os.path.exists(dest):
-        shutil.rmtree(dest)
-    os.makedirs(dest)
 
     if "drive.google.com" in url or "drive.usercontent.google.com" in url:
         m = re.search(r"(?:id=|/d/)([a-zA-Z0-9_-]{20,})", url)
         if not m:
             raise ValueError(f"Cannot parse Google Drive file ID from: {url}")
-        file_id = m.group(1)
-        log(f"  Google Drive ID: {file_id}")
-        resp = _gdrive_get_stream(file_id)
+        log(f"  Google Drive ID: {m.group(1)}")
+        resp = _gdrive_get_stream(m.group(1))
     else:
         log("  Streaming direct URL...")
         resp = requests.get(url, stream=True, timeout=120)
         resp.raise_for_status()
 
-    resp.raw.decode_content = True
-    with tf_lib.open(fileobj=resp.raw, mode="r|gz") as tar:
-        tar.extractall(dest)
-    log(f"  Streamed and extracted to: {dest}")
+    if "text/html" in resp.headers.get("content-type", "").lower():
+        resp.close()
+        raise RuntimeError(
+            "Server returned an HTML page instead of the archive "
+            "(Google Drive confirmation flow failed)"
+        )
+    return resp
 
 
-def _remove_corrupt_images(root: str) -> int:
-    """Delete images unreadable by PIL or OpenCV (what YOLO uses). Returns count."""
-    from PIL import Image as _PIL
-    import cv2 as _cv2
-    IMG_EXTS = {'.jpg', '.jpeg', '.png'}
-    removed = 0
-    for p in pathlib.Path(root).rglob("*"):
-        if p.suffix.lower() in IMG_EXTS:
-            bad = False
+def _ingest_image_bytes(data: bytes, out_path: pathlib.Path, short_side: int) -> bool:
+    """Decode, EXIF-rotate, downscale (short side to short_side, never upscale)
+    and re-encode as a clean JPEG. Returns False if the image is unreadable.
+    """
+    import io
+    from PIL import Image, ImageOps
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        img = ImageOps.exif_transpose(img).convert("RGB")
+    except Exception:
+        return False
+    w, h = img.size
+    scale = short_side / min(w, h)
+    if scale < 1:
+        img = img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, "JPEG", quality=INGEST_JPEG_QUALITY)
+    return True
+
+
+def _normalize_images(root: str, short_side: int) -> tuple:
+    """Validate and downscale every image under root in place (re-encoded as JPEG).
+    Deletes unreadable files. Returns (kept, removed).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    exts = {".jpg", ".jpeg", ".png"}
+    paths = [p for p in pathlib.Path(root).rglob("*") if p.suffix.lower() in exts]
+
+    def work(p: pathlib.Path) -> bool:
+        try:
+            data = p.read_bytes()
+        except OSError:
+            return False
+        if not _ingest_image_bytes(data, p.with_suffix(".jpg"), short_side):
+            p.unlink(missing_ok=True)
+            return False
+        if p.suffix != ".jpg":
+            p.unlink(missing_ok=True)
+        return True
+
+    with ThreadPoolExecutor(INGEST_THREADS) as pool:
+        results = list(pool.map(work, paths))
+    kept = sum(results)
+    return kept, len(paths) - kept
+
+
+def _stream_extract_images(url: str, dest: str, short_side: int, attempts: int = 3):
+    """Stream a tar/tar.gz of images; validate + downscale each member on the fly.
+
+    Neither the archive nor the original full-size images ever touch the disk,
+    so peak disk and page-cache use stay near the final downscaled dataset size.
+    """
+    import tarfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    exts = {".jpg", ".jpeg", ".png"}
+    for attempt in range(1, attempts + 1):
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        os.makedirs(dest)
+        counts = {"kept": 0, "corrupt": 0}
+        first_error = [None]
+        lock = threading.Lock()
+        sem = threading.Semaphore(INGEST_THREADS * 2)
+
+        def work(data: bytes, out_path: pathlib.Path):
             try:
-                with _PIL.open(p) as img:
-                    img.load()
-            except Exception:
-                bad = True
-            if not bad and _cv2.imread(str(p)) is None:
-                bad = True
-            if bad:
-                p.unlink(missing_ok=True)
-                removed += 1
-    return removed
+                ok = _ingest_image_bytes(data, out_path, short_side)
+                with lock:
+                    counts["kept" if ok else "corrupt"] += 1
+            except Exception as exc:
+                if first_error[0] is None:
+                    first_error[0] = exc
+            finally:
+                sem.release()
+
+        try:
+            resp = _open_stream(url)
+            resp.raw.decode_content = True
+            with tarfile.open(fileobj=resp.raw, mode="r|*") as tar, \
+                    ThreadPoolExecutor(INGEST_THREADS) as pool:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    rel = pathlib.PurePosixPath(member.name)
+                    if rel.is_absolute() or ".." in rel.parts:
+                        continue
+                    if rel.suffix.lower() not in exts:
+                        continue
+                    fobj = tar.extractfile(member)
+                    if fobj is None:
+                        continue
+                    sem.acquire()
+                    data = fobj.read()
+                    out = pathlib.Path(dest, *rel.parts).with_suffix(".jpg")
+                    pool.submit(work, data, out)
+            if first_error[0]:
+                raise first_error[0]
+            log(f"  Ingested {counts['kept']} images "
+                f"({counts['corrupt']} corrupt skipped) -> {dest}")
+            return
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            log(f"  Stream attempt {attempt}/{attempts} failed: {exc} — retrying...")
 
 
 def find_train_root(extract_dir: str) -> str:
@@ -460,10 +549,9 @@ def _plot_error_grid(errors: list, name2idx: dict) -> str:
     return _fig_to_b64(fig)
 
 
-def run_full_eval(model_path: str, eval_root: str) -> dict:
+def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     """Run full evaluation on a flat class-folder dataset. Returns metrics + raw data for charts."""
     import numpy as np
-    from PIL import Image as PILImage
     from sklearn.metrics import (
         accuracy_score, precision_score, recall_score, f1_score,
         confusion_matrix as sk_cm, roc_auc_score, roc_curve,
@@ -487,30 +575,19 @@ def run_full_eval(model_path: str, eval_root: str) -> dict:
 
     log(f"  Eval: {len(image_paths)} images, {len(set(gt_labels))} classes")
 
-    valid_paths, valid_labels, n_skip = [], [], 0
-    for p, lbl in zip(image_paths, gt_labels):
-        try:
-            with PILImage.open(p) as img:
-                img.load()
-            valid_paths.append(p)
-            valid_labels.append(lbl)
-        except Exception:
-            n_skip += 1
-    if n_skip:
-        log(f"  Skipped {n_skip} corrupt image(s)")
-
-    eval_chunk = 100
+    chunk_size = 500
     pred_labels, pred_probs = [], []
-    for start in range(0, len(valid_paths), eval_chunk):
-        chunk = [str(p) for p in valid_paths[start:start + eval_chunk]]
-        for result in model.predict(source=chunk, imgsz=640, verbose=False, stream=True):
+    for start in range(0, len(image_paths), chunk_size):
+        chunk = [str(p) for p in image_paths[start:start + chunk_size]]
+        for result in model.predict(source=chunk, imgsz=imgsz, batch=32,
+                                    verbose=False, stream=True):
             probs = result.probs.data.cpu().numpy()
             top_idx = int(np.argmax(probs))
             pred_labels.append(model.names[top_idx])
             pred_probs.append(probs)
 
     probs_arr = np.stack(pred_probs)
-    y_true = np.array(valid_labels)
+    y_true = np.array(gt_labels)
     y_pred = np.array(pred_labels)
 
     accuracy = round(float(accuracy_score(y_true, y_pred)) * 100, 2)
@@ -543,17 +620,17 @@ def run_full_eval(model_path: str, eval_root: str) -> dict:
 
     cm = sk_cm(y_true, y_pred, labels=classes)
     errors = [
-        (valid_paths[i], valid_labels[i], pred_labels[i], probs_arr[i])
-        for i in range(len(valid_paths)) if valid_labels[i] != pred_labels[i]
+        (image_paths[i], gt_labels[i], pred_labels[i], probs_arr[i])
+        for i in range(len(image_paths)) if gt_labels[i] != pred_labels[i]
     ]
     errors.sort(key=lambda x: -float(x[3][name2idx.get(x[2], 0)]))
-    log(f"  Accuracy: {accuracy}%  errors: {len(errors)}/{len(valid_paths)}")
+    log(f"  Accuracy: {accuracy}%  errors: {len(errors)}/{len(image_paths)}")
 
     return {
         "accuracy": accuracy,
         "per_class": per_class,
         "classes": classes,
-        "total": len(valid_paths),
+        "total": len(image_paths),
         "n_errors": len(errors),
         "cm": cm,
         "fpr_tpr": fpr_tpr,
@@ -769,8 +846,11 @@ def handler(job: dict):
     repo = inp.get("repo")
 
     log(f"=== Job start: {run_name} ===")
+    ingest_size = max(INGEST_SHORT_SIDE, imgsz)
 
     try:
+        shutil.rmtree(RUNS_DIR, ignore_errors=True)
+
         yield {"status": "downloading"}
         log("==> Downloading training dataset...")
         _download(dataset_url, TRAIN_ARCHIVE)
@@ -778,10 +858,12 @@ def handler(job: dict):
         yield {"status": "extracting"}
         log("==> Extracting...")
         _extract(TRAIN_ARCHIVE, TRAIN_DIR)
+        os.remove(TRAIN_ARCHIVE)
         dataset_root = find_train_root(TRAIN_DIR)
-        n_corrupt = _remove_corrupt_images(dataset_root)
-        if n_corrupt:
-            log(f"  Skipped {n_corrupt} corrupt training image(s)")
+
+        log("==> Normalizing training images (validate + downscale)...")
+        kept, removed = _normalize_images(dataset_root, ingest_size)
+        log(f"  {kept} images ready, {removed} corrupt removed")
 
         log("==> Training...")
         best_pt = yield from _train_with_progress(
@@ -795,15 +877,7 @@ def handler(job: dict):
         report_url = None
 
         log("==> Cleaning up training artifacts...")
-        for path in [TRAIN_ARCHIVE, TRAIN_DIR]:
-            try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                elif os.path.exists(path):
-                    os.remove(path)
-                log(f"  Removed {path}")
-            except Exception as exc:
-                log(f"  Warning: could not remove {path}: {exc}")
+        shutil.rmtree(TRAIN_DIR, ignore_errors=True)
 
         if release_tag and github_token and repo:
             yield {"status": "releasing", "tag": release_tag}
@@ -813,21 +887,18 @@ def handler(job: dict):
 
             if eval_dataset_url:
                 yield {"status": "evaluating"}
-                log("==> Downloading & extracting eval dataset (streaming)...")
-                _stream_extract(eval_dataset_url, EVAL_DIR)
+                log("==> Streaming eval dataset (downscale on ingest)...")
+                _stream_extract_images(eval_dataset_url, EVAL_DIR, ingest_size)
                 eval_root = find_eval_root(EVAL_DIR)
-                n_corrupt = _remove_corrupt_images(eval_root)
-                if n_corrupt:
-                    log(f"  Removed {n_corrupt} corrupt eval image(s)")
 
                 log("==> Evaluating new model...")
-                new_eval = run_full_eval(best_pt, eval_root)
+                new_eval = run_full_eval(best_pt, eval_root, imgsz)
 
                 prev_path, prev_tag = get_previous_model(github_token, repo, release_tag)
                 prev_eval = None
                 if prev_path:
                     log("==> Evaluating previous model...")
-                    prev_eval = run_full_eval(prev_path, eval_root)
+                    prev_eval = run_full_eval(prev_path, eval_root, imgsz)
 
                 log("==> Generating and publishing report...")
                 try:
