@@ -253,11 +253,13 @@ def _normalize_images(root: str, short_side: int) -> tuple:
     return kept, len(paths) - kept
 
 
-def _stream_extract_images(url: str, dest: str, short_side: int, attempts: int = 3):
+def _stream_extract_images(url: str, dest: str, short_side: int,
+                           progress_cb=None, attempts: int = 3):
     """Stream a tar/tar.gz of images; validate + downscale each member on the fly.
 
     Neither the archive nor the original full-size images ever touch the disk,
     so peak disk and page-cache use stay near the final downscaled dataset size.
+    Calls progress_cb(done, corrupt) every 500 images if provided.
     """
     import tarfile
     from concurrent.futures import ThreadPoolExecutor
@@ -277,6 +279,9 @@ def _stream_extract_images(url: str, dest: str, short_side: int, attempts: int =
                 ok = _ingest_image_bytes(data, out_path, short_side)
                 with lock:
                     counts["kept" if ok else "corrupt"] += 1
+                    done = counts["kept"] + counts["corrupt"]
+                if done % 500 == 0 and progress_cb:
+                    progress_cb(done, counts["corrupt"])
             except Exception as exc:
                 if first_error[0] is None:
                     first_error[0] = exc
@@ -312,6 +317,34 @@ def _stream_extract_images(url: str, dest: str, short_side: int, attempts: int =
             if attempt == attempts:
                 raise
             log(f"  Stream attempt {attempt}/{attempts} failed: {exc} — retrying...")
+
+
+def _stream_eval_with_progress(url: str, dest: str, short_side: int):
+    """Generator: run _stream_extract_images in a thread, yielding progress dicts."""
+    progress_q = queue.Queue()
+    error_holder = [None]
+
+    def on_progress(done, corrupt):
+        progress_q.put({"status": "evaluating", "images": done, "corrupt": corrupt})
+
+    def run():
+        try:
+            _stream_extract_images(url, dest, short_side, progress_cb=on_progress)
+        except Exception as exc:
+            error_holder[0] = exc
+        finally:
+            progress_q.put(None)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    while True:
+        item = progress_q.get()
+        if item is None:
+            break
+        yield item
+    t.join()
+    if error_holder[0]:
+        raise error_holder[0]
 
 
 def find_train_root(extract_dir: str) -> str:
@@ -861,6 +894,7 @@ def handler(job: dict):
         os.remove(TRAIN_ARCHIVE)
         dataset_root = find_train_root(TRAIN_DIR)
 
+        yield {"status": "normalizing"}
         log("==> Normalizing training images (validate + downscale)...")
         kept, removed = _normalize_images(dataset_root, ingest_size)
         log(f"  {kept} images ready, {removed} corrupt removed")
@@ -888,7 +922,7 @@ def handler(job: dict):
             if eval_dataset_url:
                 yield {"status": "evaluating"}
                 log("==> Streaming eval dataset (downscale on ingest)...")
-                _stream_extract_images(eval_dataset_url, EVAL_DIR, ingest_size)
+                yield from _stream_eval_with_progress(eval_dataset_url, EVAL_DIR, ingest_size)
                 eval_root = find_eval_root(EVAL_DIR)
 
                 log("==> Evaluating new model...")

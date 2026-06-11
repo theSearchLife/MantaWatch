@@ -47,10 +47,16 @@ def print_item(out: dict):
         print(f"[{ts()}] 📥 Downloading dataset...", flush=True)
     elif s == "extracting":
         print(f"[{ts()}] 📦 Extracting archive...", flush=True)
+    elif s == "normalizing":
+        print(f"[{ts()}] 🧹 Validating & downscaling training images...", flush=True)
     elif s == "releasing":
         print(f"[{ts()}] 🚀 Creating GitHub release...", flush=True)
     elif s == "evaluating":
-        print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
+        if out.get("images") is not None:
+            print(f"[{ts()}] 📊 Eval images validated: {out['images']}"
+                  f" ({out.get('corrupt', 0)} corrupt)", flush=True)
+        else:
+            print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
     elif s not in ("done", ""):
         print(f"[{ts()}] {out}", flush=True)
 
