@@ -2,7 +2,9 @@
 RunPod Serverless handler — YOLO manta classification training + evaluation.
 
 Input:
-    dataset_url      : Drive folder link (with train/, val/, test/) or archive URL
+    dataset_url      : Drive folder link (with train/, val/, test/) or archive URL.
+                       Folder mode downloads only train/+val/ for training and
+                       streams test/ in chunks during evaluation.
     gdrive_api_key   : Google API key, required for Drive folder links
     epochs           : int   (default 100)
     base_model       : str   (default "yolo11s-cls.pt")
@@ -26,6 +28,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import zipfile
@@ -45,6 +48,7 @@ PREV_MODEL = "/tmp/model_prev.pt"
 RUNS_DIR = "/tmp/runs"
 
 DOWNLOAD_THREADS = 16
+EVAL_CHUNK_SIZE = 500  # test images downloaded + predicted + deleted per chunk
 
 
 def log(msg: str):
@@ -171,13 +175,11 @@ def _gdrive_download_file(file_id: str, dest: pathlib.Path, api_key: str, sessio
             time.sleep(2 ** attempt)
 
 
-def _download_drive_folder(folder_id: str, dest: str, api_key: str, progress_cb=None):
-    """Download every image from a Drive folder via the official API.
+def _download_drive_items(items: list, dest: str, api_key: str, progress_cb=None):
+    """Download [(file_id, rel_path), ...] into dest, preserving the rel structure.
 
-    API downloads have no HTML confirmation pages and use request quotas
-    instead of the anonymous abuse heuristics that lock large files.
     fsync + fadvise after each file keep the page cache flat so the container
-    memory watchdog is not triggered by the write volume.
+    memory watchdog is not tripped by the write volume.
     """
     import requests
     from concurrent.futures import ThreadPoolExecutor
@@ -185,40 +187,30 @@ def _download_drive_folder(folder_id: str, dest: str, api_key: str, progress_cb=
     if os.path.exists(dest):
         shutil.rmtree(dest)
     os.makedirs(dest)
-
-    log("  Listing Drive folder via API...")
-    listing = _gdrive_list_folder(folder_id, api_key)
-    exts = {".jpg", ".jpeg", ".png"}
-    images = []
-    for fid, rel in listing:
-        rel_path = pathlib.PurePosixPath(rel)
-        if ".." in rel_path.parts or rel_path.suffix.lower() not in exts:
-            continue
-        images.append((fid, rel_path.parts))
-    log(f"  {len(images)} images to download")
-    if not images:
+    if not items:
         raise RuntimeError(
-            "Drive folder listing returned no images — "
-            "check the folder link, sharing settings and API key"
+            "No images to download — check the folder link, sharing and API key"
         )
+    log(f"  {len(items)} images to download")
 
     counts = {"done": 0}
     lock = threading.Lock()
     tls = threading.local()
 
     def work(item):
-        fid, parts = item
+        fid, rel = item
         if not hasattr(tls, "session"):
             tls.session = requests.Session()
+        parts = pathlib.PurePosixPath(rel).parts
         _gdrive_download_file(fid, pathlib.Path(dest, *parts), api_key, tls.session)
         with lock:
             counts["done"] += 1
             done = counts["done"]
         if done % 500 == 0 and progress_cb:
-            progress_cb(done, len(images))
+            progress_cb(done, len(items))
 
     with ThreadPoolExecutor(DOWNLOAD_THREADS) as pool:
-        list(pool.map(work, images))
+        list(pool.map(work, items))
     log(f"  Downloaded {counts['done']} images -> {dest}")
 
 
@@ -228,24 +220,80 @@ def _drive_folder_id(url: str):
     return m.group(1) if m else None
 
 
-def _fetch_train_dataset(url: str, dest: str, api_key: str, progress_cb=None):
-    """Dispatch dataset download: Drive folder link -> API loader, else archive.
+def _partition_dataset_listing(listing: list):
+    """Split a Drive listing into (train_val_items, test_items).
 
-    A folder link must point at the dataset root whose subtree holds train/,
-    val/ and test/ splits, matching the archive layout.
+    train_val_items: [(file_id, rel_path)] under train/ and val/ — downloaded to disk.
+    test_items:      [(file_id, label, suffix)] under test/ — streamed during eval.
+    Tolerates one extra nesting level above the split folders.
     """
-    folder_id = _drive_folder_id(url)
-    if folder_id:
-        if not api_key:
-            raise ValueError(
-                "dataset_url points to a Drive folder — "
-                "the 'gdrive_api_key' job input is required for the Drive API"
-            )
-        _download_drive_folder(folder_id, dest, api_key, progress_cb)
-    else:
-        _download(url, TRAIN_ARCHIVE)
-        _extract(TRAIN_ARCHIVE, dest)
-        os.remove(TRAIN_ARCHIVE)
+    exts = {".jpg", ".jpeg", ".png"}
+
+    prefix = ""
+    for _fid, rel in listing:
+        parts = pathlib.PurePosixPath(rel).parts
+        if "train" in parts:
+            prefix = "/".join(parts[:parts.index("train")])
+            break
+    if prefix:
+        prefix += "/"
+
+    train_val, test = [], []
+    for fid, rel in listing:
+        if not rel.startswith(prefix):
+            continue
+        sub = rel[len(prefix):]
+        sub_path = pathlib.PurePosixPath(sub)
+        parts = sub_path.parts
+        if len(parts) < 2 or sub_path.suffix.lower() not in exts:
+            continue
+        if parts[0] in ("train", "val"):
+            train_val.append((fid, sub))
+        elif parts[0] == "test":
+            test.append((fid, parts[1], sub_path.suffix))
+    return train_val, test
+
+
+def _download_eval_chunk(items: list, dest_dir: str, api_key: str):
+    """Download a chunk of test images [(file_id, label, suffix)] into dest_dir.
+
+    Validates each with PIL + OpenCV (what YOLO uses); corrupt ones are skipped.
+    Returns (paths, labels, file_ids) aligned over the valid images only.
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
+    import cv2
+
+    tls = threading.local()
+    out = [None] * len(items)
+
+    def work(idx_item):
+        idx, (fid, label, suffix) = idx_item
+        if not hasattr(tls, "session"):
+            tls.session = requests.Session()
+        path = pathlib.Path(dest_dir, f"{idx}{(suffix or '.jpg').lower()}")
+        try:
+            _gdrive_download_file(fid, path, api_key, tls.session)
+            with Image.open(path) as im:
+                im.load()
+            if cv2.imread(str(path)) is None:
+                raise ValueError("OpenCV cannot read image")
+            out[idx] = (str(path), label, fid)
+        except Exception:
+            path.unlink(missing_ok=True)
+            out[idx] = None
+
+    with ThreadPoolExecutor(DOWNLOAD_THREADS) as pool:
+        list(pool.map(work, enumerate(items)))
+
+    paths, labels, fids = [], [], []
+    for rec in out:
+        if rec:
+            paths.append(rec[0])
+            labels.append(rec[1])
+            fids.append(rec[2])
+    return paths, labels, fids
 
 
 def _run_with_progress(fetch_fn, status: str):
@@ -511,15 +559,63 @@ def _plot_error_grid(errors: list, name2idx: dict) -> str:
     return _fig_to_b64(fig)
 
 
-def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
-    """Run full evaluation on a flat class-folder dataset. Returns metrics + raw data for charts."""
+def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> dict:
+    """Build the evaluation result dict from accumulated predictions.
+
+    error_grid: list of (image_path, true, pred, probs) for the report's grid (<=12).
+    n_errors is the total mismatch count, computed from the arrays.
+    """
     import numpy as np
-    from PIL import Image as PILImage
     from sklearn.metrics import (
         accuracy_score, precision_score, recall_score, f1_score,
         confusion_matrix as sk_cm, roc_auc_score, roc_curve,
     )
     from sklearn.preprocessing import label_binarize
+
+    accuracy = round(float(accuracy_score(y_true, y_pred)) * 100, 2)
+    prec_arr = precision_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
+    rec_arr = recall_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
+    f1_arr = f1_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
+
+    y_bin = label_binarize(y_true, classes=classes)
+    y_score = np.stack([probs_arr[:, name2idx[c]] for c in classes], axis=1)
+    auc_per, fpr_tpr = {}, {}
+    for i, cls in enumerate(classes):
+        try:
+            auc_per[cls] = round(float(roc_auc_score(y_bin[:, i], y_score[:, i])), 4)
+            fpr, tpr, _ = roc_curve(y_bin[:, i], y_score[:, i])
+            fpr_tpr[cls] = (fpr.tolist(), tpr.tolist())
+        except Exception:
+            auc_per[cls] = None
+
+    per_class = {
+        cls: {
+            "precision": round(float(prec_arr[i]) * 100, 2),
+            "recall": round(float(rec_arr[i]) * 100, 2),
+            "f1": round(float(f1_arr[i]) * 100, 2),
+            "auc": auc_per.get(cls),
+            "support": int((y_true == cls).sum()),
+        }
+        for i, cls in enumerate(classes)
+    }
+    return {
+        "accuracy": accuracy,
+        "per_class": per_class,
+        "classes": classes,
+        "total": int(len(y_true)),
+        "n_errors": int((y_true != y_pred).sum()),
+        "cm": sk_cm(y_true, y_pred, labels=classes),
+        "fpr_tpr": fpr_tpr,
+        "auc_per": auc_per,
+        "errors": error_grid,
+        "name2idx": name2idx,
+    }
+
+
+def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
+    """Evaluate one model on an on-disk class-folder dataset (archive mode)."""
+    import numpy as np
+    from PIL import Image as PILImage
     from ultralytics import YOLO
 
     model = YOLO(model_path)
@@ -550,69 +646,106 @@ def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     if n_skip:
         log(f"  Skipped {n_skip} corrupt image(s)")
 
-    chunk_size = 500
     pred_labels, pred_probs = [], []
-    for start in range(0, len(valid_paths), chunk_size):
-        chunk = [str(p) for p in valid_paths[start:start + chunk_size]]
+    for start in range(0, len(valid_paths), EVAL_CHUNK_SIZE):
+        chunk = [str(p) for p in valid_paths[start:start + EVAL_CHUNK_SIZE]]
         for result in model.predict(source=chunk, imgsz=imgsz, batch=32,
                                     verbose=False, stream=True):
             probs = result.probs.data.cpu().numpy()
-            top_idx = int(np.argmax(probs))
-            pred_labels.append(model.names[top_idx])
+            pred_labels.append(model.names[int(np.argmax(probs))])
             pred_probs.append(probs)
 
     probs_arr = np.stack(pred_probs)
-    y_true = np.array(valid_labels)
-    y_pred = np.array(pred_labels)
-
-    accuracy = round(float(accuracy_score(y_true, y_pred)) * 100, 2)
-    prec_arr = precision_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
-    rec_arr = recall_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
-    f1_arr = f1_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
-
-    y_bin = label_binarize(y_true, classes=classes)
-    y_score = np.stack([probs_arr[:, name2idx[c]] for c in classes], axis=1)
-
-    auc_per, fpr_tpr = {}, {}
-    for i, cls in enumerate(classes):
-        try:
-            auc_per[cls] = round(float(roc_auc_score(y_bin[:, i], y_score[:, i])), 4)
-            fpr, tpr, _ = roc_curve(y_bin[:, i], y_score[:, i])
-            fpr_tpr[cls] = (fpr.tolist(), tpr.tolist())
-        except Exception:
-            auc_per[cls] = None
-
-    per_class = {
-        cls: {
-            "precision": round(float(prec_arr[i]) * 100, 2),
-            "recall": round(float(rec_arr[i]) * 100, 2),
-            "f1": round(float(f1_arr[i]) * 100, 2),
-            "auc": auc_per.get(cls),
-            "support": int((y_true == cls).sum()),
-        }
-        for i, cls in enumerate(classes)
-    }
-
-    cm = sk_cm(y_true, y_pred, labels=classes)
     errors = [
         (valid_paths[i], valid_labels[i], pred_labels[i], probs_arr[i])
         for i in range(len(valid_paths)) if valid_labels[i] != pred_labels[i]
     ]
     errors.sort(key=lambda x: -float(x[3][name2idx.get(x[2], 0)]))
-    log(f"  Accuracy: {accuracy}%  errors: {len(errors)}/{len(valid_paths)}")
+    ev = _eval_metrics(np.array(valid_labels), np.array(pred_labels),
+                       probs_arr, classes, name2idx, errors[:12])
+    log(f"  Accuracy: {ev['accuracy']}%  errors: {ev['n_errors']}/{ev['total']}")
+    return ev
 
-    return {
-        "accuracy": accuracy,
-        "per_class": per_class,
-        "classes": classes,
-        "total": len(valid_paths),
-        "n_errors": len(errors),
-        "cm": cm,
-        "fpr_tpr": fpr_tpr,
-        "auc_per": auc_per,
-        "errors": errors,
-        "name2idx": name2idx,
-    }
+
+def run_chunked_eval(model_paths: dict, test_items: list, api_key: str, imgsz: int = 640):
+    """Stream the test split from Drive in chunks, evaluating every model in one pass.
+
+    Each chunk is downloaded, predicted by all models, then deleted, so peak disk
+    stays near one chunk regardless of test-set size.
+
+    model_paths: {"new": path[, "prev": path]} — the first key is the primary model
+                 (its top misclassifications populate the report's error grid).
+    test_items:  [(file_id, label, suffix)]
+    Generator: yields {"status":"evaluating","images":done,"total":N};
+    returns {name: eval_dict} via StopIteration (use `best = yield from ...`).
+    """
+    import numpy as np
+    import requests
+    from ultralytics import YOLO
+
+    models = {name: YOLO(path) for name, path in model_paths.items()}
+    meta = {name: (list(m.names.values()), {v: k for k, v in m.names.items()})
+            for name, m in models.items()}
+    primary = next(iter(models))
+    primary_name2idx = meta[primary][1]
+
+    acc = {name: {"true": [], "pred": [], "probs": []} for name in models}
+    err_cand = []  # (conf, file_id, suffix, true, pred, probs) for the primary model
+    total = len(test_items)
+    done = 0
+
+    for start in range(0, total, EVAL_CHUNK_SIZE):
+        chunk = test_items[start:start + EVAL_CHUNK_SIZE]
+        tmp = tempfile.mkdtemp(prefix="evalchunk_", dir="/tmp")
+        try:
+            paths, labels, fids = _download_eval_chunk(chunk, tmp, api_key)
+            for name, model in (models.items() if paths else ()):
+                for i, result in enumerate(model.predict(
+                    source=paths, imgsz=imgsz, batch=32, verbose=False, stream=True,
+                )):
+                    probs = result.probs.data.cpu().numpy()
+                    pred = model.names[int(np.argmax(probs))]
+                    acc[name]["true"].append(labels[i])
+                    acc[name]["pred"].append(pred)
+                    acc[name]["probs"].append(probs)
+                    if name == primary and labels[i] != pred:
+                        conf = float(probs[primary_name2idx.get(pred, 0)])
+                        suffix = pathlib.Path(paths[i]).suffix
+                        err_cand.append((conf, fids[i], suffix, labels[i], pred, probs))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        done += len(chunk)
+        yield {"status": "evaluating", "images": min(done, total), "total": total}
+
+    if not acc[primary]["true"]:
+        raise RuntimeError("No test images could be downloaded/decoded for evaluation")
+
+    # Re-download the top-12 misclassified images for the report's error grid.
+    err_cand.sort(key=lambda x: -x[0])
+    err_dir = "/tmp/eval_errors"
+    shutil.rmtree(err_dir, ignore_errors=True)
+    os.makedirs(err_dir, exist_ok=True)
+    grid = []
+    session = requests.Session()
+    for i, (_conf, fid, suffix, true, pred, probs) in enumerate(err_cand[:12]):
+        path = pathlib.Path(err_dir, f"err_{i}{(suffix or '.jpg').lower()}")
+        try:
+            _gdrive_download_file(fid, path, api_key, session)
+            grid.append((str(path), true, pred, probs))
+        except Exception:
+            pass
+
+    results = {}
+    for name in models:
+        classes, name2idx = meta[name]
+        results[name] = _eval_metrics(
+            np.array(acc[name]["true"]), np.array(acc[name]["pred"]),
+            np.stack(acc[name]["probs"]), classes, name2idx,
+            grid if name == primary else [],
+        )
+    log(f"  Accuracy: {results[primary]['accuracy']}%  "
+        f"errors: {results[primary]['n_errors']}/{results[primary]['total']}")
+    return results
 
 
 def _delta_fmt(new_val, prev_val):
@@ -825,22 +958,41 @@ def handler(job: dict):
     try:
         shutil.rmtree(RUNS_DIR, ignore_errors=True)
 
+        # Folder mode streams test/ during eval; archive mode keeps it on disk.
+        folder_id = _drive_folder_id(dataset_url)
+        test_items = None
+
         yield {"status": "downloading"}
         log("==> Downloading dataset...")
-        yield from _run_with_progress(
-            lambda progress_cb: _fetch_train_dataset(
-                dataset_url, TRAIN_DIR, gdrive_api_key, progress_cb
-            ),
-            "downloading",
-        )
+        if folder_id:
+            if not gdrive_api_key:
+                raise ValueError(
+                    "dataset_url is a Drive folder — the 'gdrive_api_key' input is required"
+                )
+            log("  Listing Drive folder via API...")
+            listing = _gdrive_list_folder(folder_id, gdrive_api_key)
+            train_items, test_items = _partition_dataset_listing(listing)
+            log(f"  train/val: {len(train_items)} images · test: {len(test_items)} images")
+            yield from _run_with_progress(
+                lambda progress_cb: _download_drive_items(
+                    train_items, TRAIN_DIR, gdrive_api_key, progress_cb
+                ),
+                "downloading",
+            )
+        else:
+            _download(dataset_url, TRAIN_ARCHIVE)
+            _extract(TRAIN_ARCHIVE, TRAIN_DIR)
+            os.remove(TRAIN_ARCHIVE)
+
         dataset_root = find_train_root(TRAIN_DIR)
         n_corrupt = _remove_corrupt_images(dataset_root)
         if n_corrupt:
             log(f"  Removed {n_corrupt} corrupt image(s)")
 
-        # Evaluation runs on the dataset's own test/ split.
-        test_dir = os.path.join(dataset_root, "test")
-        have_test = os.path.isdir(test_dir)
+        # Resolve eval source: streamed test/ (folder) or on-disk test/ (archive).
+        disk_test = os.path.join(dataset_root, "test")
+        have_disk_test = test_items is None and os.path.isdir(disk_test)
+        have_eval = bool(test_items) or have_disk_test
 
         log("==> Training...")
         best_pt = yield from _train_with_progress(
@@ -853,11 +1005,12 @@ def handler(job: dict):
         release_url = None
         report_url = None
 
-        # Free disk: drop train/ and val/ (test/ is kept for evaluation).
-        log("==> Cleaning up training artifacts...")
+        # Free disk: drop the training data. In folder mode test/ is streamed, so
+        # the whole dir goes; in archive mode test/ lives on disk and is kept.
+        log("==> Removing training data from disk...")
         for sub in ("train", "val"):
             shutil.rmtree(os.path.join(dataset_root, sub), ignore_errors=True)
-        if not have_test:
+        if not have_disk_test:
             shutil.rmtree(TRAIN_DIR, ignore_errors=True)
 
         if release_tag and github_token and repo:
@@ -866,19 +1019,31 @@ def handler(job: dict):
             release_url = create_github_release(best_pt, github_token, repo, release_tag)
             log(f"  Release: {release_url}")
 
-            if have_test:
+            if have_eval:
                 # The release is already published; evaluation is best-effort.
                 # Any failure here is logged but must not abort the final result.
                 try:
                     yield {"status": "evaluating"}
-                    log(f"==> Evaluating new model on {test_dir}...")
-                    new_eval = run_full_eval(best_pt, test_dir, imgsz)
-
                     prev_path, prev_tag = get_previous_model(github_token, repo, release_tag)
-                    prev_eval = None
+                    model_paths = {"new": best_pt}
                     if prev_path:
-                        log("==> Evaluating previous model...")
-                        prev_eval = run_full_eval(prev_path, test_dir, imgsz)
+                        model_paths["prev"] = prev_path
+
+                    if test_items is not None:
+                        log(f"==> Chunked eval: streaming {len(test_items)} test images "
+                            f"in chunks of {EVAL_CHUNK_SIZE}...")
+                        evals = yield from run_chunked_eval(
+                            model_paths, test_items, gdrive_api_key, imgsz
+                        )
+                    else:
+                        log(f"==> Evaluating new model on {disk_test}...")
+                        evals = {"new": run_full_eval(best_pt, disk_test, imgsz)}
+                        if prev_path:
+                            log("==> Evaluating previous model...")
+                            evals["prev"] = run_full_eval(prev_path, disk_test, imgsz)
+
+                    new_eval = evals["new"]
+                    prev_eval = evals.get("prev")
 
                     log("==> Generating and publishing report...")
                     html = generate_report_html(new_eval, prev_eval, release_tag, prev_tag)

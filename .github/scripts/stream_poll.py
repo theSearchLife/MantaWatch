@@ -63,7 +63,11 @@ def print_item(out: dict):
     elif s == "releasing":
         print(f"[{ts()}] 🚀 Creating GitHub release...", flush=True)
     elif s == "evaluating":
-        print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
+        if out.get("images") is not None:
+            total = out.get("total") or "?"
+            print(f"[{ts()}] 📊 Test images evaluated: {out['images']}/{total}", flush=True)
+        else:
+            print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
     elif s not in ("done", ""):
         print(f"[{ts()}] {out}", flush=True)
 
