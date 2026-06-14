@@ -201,18 +201,63 @@ def _hf_image_count(repo_id: str, token, prefixes: tuple) -> int:
 
 
 def _download_hf_dataset(repo_id: str, dest: str, token, patterns: list):
-    """Download dataset files matching `patterns` from a HF dataset repo into `dest`.
+    """Download images under the given top-level `patterns` from a HF dataset repo.
 
-    Uses the HF Hub CDN with parallel workers — no per-file quota or confirmation
-    pages (unlike Google Drive). hf_transfer is deliberately NOT used: it speeds up
-    single large files but hangs on many small files (it stalled at ~1000 of 8099).
+    Uses a direct threaded downloader over the resolve/CDN URLs rather than
+    snapshot_download, which is slow and stall-prone for thousands of small LFS
+    files (~1.4 img/s, oscillating) where a plain parallel GET is ~9 img/s steady.
+    fsync + fadvise keep the page cache flat so the memory watchdog is not tripped.
     """
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-    from huggingface_hub import snapshot_download
-    snapshot_download(
-        repo_id=repo_id, repo_type="dataset", local_dir=dest,
-        allow_patterns=patterns, token=token or None, max_workers=HF_WORKERS,
-    )
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+    from huggingface_hub import HfApi
+
+    prefixes = tuple(p.split("*")[0] for p in patterns)  # "train/**" -> "train/"
+    exts = {".jpg", ".jpeg", ".png"}
+    files = [
+        f for f in HfApi().list_repo_files(repo_id, repo_type="dataset", token=token or None)
+        if f.startswith(prefixes) and pathlib.PurePosixPath(f).suffix.lower() in exts
+    ]
+    if not files:
+        raise RuntimeError(f"No images matched {patterns} in HF dataset {repo_id}")
+    log(f"  {len(files)} files to download from HF")
+
+    base = f"https://huggingface.co/datasets/{repo_id}/resolve/main/"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    tls = threading.local()
+    counts = {"ok": 0, "fail": 0}
+    lock = threading.Lock()
+
+    def work(rel):
+        if not hasattr(tls, "s"):
+            tls.s = requests.Session()
+        out = pathlib.Path(dest, *pathlib.PurePosixPath(rel).parts)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        for attempt in range(3):
+            try:
+                with tls.s.get(base + rel, headers=headers, stream=True, timeout=(10, 60)) as r:
+                    r.raise_for_status()
+                    with open(out, "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                        f.flush()
+                        os.fsync(f.fileno())
+                        if hasattr(os, "posix_fadvise"):
+                            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                with lock:
+                    counts["ok"] += 1
+                return
+            except Exception:
+                if attempt == 2:
+                    out.unlink(missing_ok=True)
+                    with lock:
+                        counts["fail"] += 1
+                    return
+                time.sleep(2 ** attempt)
+
+    with ThreadPoolExecutor(HF_WORKERS) as pool:
+        list(pool.map(work, files))
+    log(f"  Downloaded {counts['ok']}/{len(files)} files ({counts['fail']} failed) -> {dest}")
 
 
 def _download_hf_with_progress(repo_id: str, dest: str, token, patterns: list,
