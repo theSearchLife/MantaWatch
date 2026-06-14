@@ -48,11 +48,70 @@ PREV_MODEL = "/tmp/model_prev.pt"
 RUNS_DIR = "/tmp/runs"
 
 DOWNLOAD_THREADS = 16
-EVAL_CHUNK_SIZE = 500  # test images downloaded + predicted + deleted per chunk
+EVAL_CHUNK_SIZE = 100  # test images downloaded + predicted + deleted per chunk
+EVAL_PREDICT_BATCH = 16  # images decoded into RAM at once during inference
 
 
 def log(msg: str):
     print(msg, flush=True)
+
+
+def _cgroup_mem():
+    """Return (usage_mb, limit_mb) for this container's cgroup, or (None, None).
+
+    This is the memory the OOM-killer actually watches — /proc/meminfo inside a
+    container reports the host, not the cgroup limit.
+    """
+    pairs = [
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),                      # v2
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),                                      # v1
+    ]
+    for usage_f, limit_f in pairs:
+        try:
+            usage = int(open(usage_f).read().strip())
+            raw = open(limit_f).read().strip()
+            limit = None if raw == "max" else int(raw)
+            mb = 1024 * 1024
+            if limit and limit > (1 << 62):  # v1 sentinel for "unlimited"
+                limit = None
+            return usage // mb, (limit // mb if limit else None)
+        except Exception:
+            continue
+    return None, None
+
+
+def log_mem(tag: str):
+    usage, limit = _cgroup_mem()
+    if usage is not None:
+        detail = f" / {limit} MB limit ({100 * usage // limit}%)" if limit else ""
+        log(f"  [mem] {tag}: {usage} MB used{detail}")
+
+
+def _start_mem_logger(interval: int = 15):
+    """Log cgroup memory every `interval`s on a daemon thread. Returns a stop Event."""
+    stop = threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            log_mem("sample")
+            stop.wait(interval)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return stop
+
+
+def _free_torch_memory():
+    """Run Python GC and release cached CUDA memory."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 def _download(url: str, dest: str):
@@ -158,7 +217,7 @@ def _gdrive_download_file(file_id: str, dest: pathlib.Path, api_key: str, sessio
             with session.get(url,
                              params={"alt": "media", "key": api_key,
                                      "supportsAllDrives": "true"},
-                             stream=True, timeout=120) as r:
+                             stream=True, timeout=(10, 30)) as r:
                 r.raise_for_status()
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with open(dest, "wb") as f:
@@ -366,6 +425,7 @@ def _train_with_progress(dataset_root, run_name, base_model, epochs, imgsz, batc
             })
 
     def run():
+        model = None
         try:
             from ultralytics import YOLO
             model = YOLO(base_model)
@@ -382,6 +442,13 @@ def _train_with_progress(dataset_root, run_name, base_model, epochs, imgsz, batc
         except Exception as e:
             error_holder[0] = e
         finally:
+            # Ultralytics retains the model/trainer/cached dataset in RAM after
+            # train(); release it before eval or the container OOMs (known issue).
+            try:
+                del model
+            except Exception:
+                pass
+            _free_torch_memory()
             progress_q.put(None)
 
     t = threading.Thread(target=run, daemon=True)
@@ -692,16 +759,23 @@ def run_chunked_eval(model_paths: dict, test_items: list, api_key: str, imgsz: i
     acc = {name: {"true": [], "pred": [], "probs": []} for name in models}
     err_cand = []  # (conf, file_id, suffix, true, pred, probs) for the primary model
     total = len(test_items)
+    n_chunks = (total + EVAL_CHUNK_SIZE - 1) // EVAL_CHUNK_SIZE
     done = 0
+    log(f"  {len(models)} model(s) loaded; streaming {total} test images "
+        f"in {n_chunks} chunks of {EVAL_CHUNK_SIZE}")
+    log_mem("eval start")
 
-    for start in range(0, total, EVAL_CHUNK_SIZE):
+    for k, start in enumerate(range(0, total, EVAL_CHUNK_SIZE), 1):
         chunk = test_items[start:start + EVAL_CHUNK_SIZE]
         tmp = tempfile.mkdtemp(prefix="evalchunk_", dir="/tmp")
         try:
+            log(f"  eval chunk {k}/{n_chunks}: downloading {len(chunk)}...")
             paths, labels, fids = _download_eval_chunk(chunk, tmp, api_key)
+            log(f"  eval chunk {k}/{n_chunks}: {len(paths)}/{len(chunk)} valid, predicting...")
             for name, model in (models.items() if paths else ()):
                 for i, result in enumerate(model.predict(
-                    source=paths, imgsz=imgsz, batch=32, verbose=False, stream=True,
+                    source=paths, imgsz=imgsz, batch=EVAL_PREDICT_BATCH,
+                    verbose=False, stream=True,
                 )):
                     probs = result.probs.data.cpu().numpy()
                     pred = model.names[int(np.argmax(probs))]
@@ -714,7 +788,9 @@ def run_chunked_eval(model_paths: dict, test_items: list, api_key: str, imgsz: i
                         err_cand.append((conf, fids[i], suffix, labels[i], pred, probs))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            _free_torch_memory()  # ultralytics predict leaks; reclaim each chunk
         done += len(chunk)
+        log_mem(f"after chunk {k}/{n_chunks}")
         yield {"status": "evaluating", "images": min(done, total), "total": total}
 
     if not acc[primary]["true"]:
@@ -954,6 +1030,14 @@ def handler(job: dict):
     gdrive_api_key = inp.get("gdrive_api_key")
 
     log(f"=== Job start: {run_name} ===")
+    try:
+        tmp_fs = subprocess.run(["stat", "-f", "-c", "%T", "/tmp"],
+                                capture_output=True, text=True).stdout.strip()
+        log(f"  /tmp filesystem: {tmp_fs or '?'}")
+    except Exception:
+        pass
+    log_mem("job start")
+    _start_mem_logger()
 
     try:
         shutil.rmtree(RUNS_DIR, ignore_errors=True)
@@ -994,11 +1078,15 @@ def handler(job: dict):
         have_disk_test = test_items is None and os.path.isdir(disk_test)
         have_eval = bool(test_items) or have_disk_test
 
+        log_mem("after download")
+
         log("==> Training...")
         best_pt = yield from _train_with_progress(
             dataset_root, run_name, base_model, epochs, imgsz, batch, patience
         )
         log("==> Training complete.")
+        _free_torch_memory()  # collect the finished training thread's leftovers
+        log_mem("after training")
 
         size_mb = round(os.path.getsize(best_pt) / 1024 / 1024, 1)
         metrics_csv = last_metrics(run_name)
