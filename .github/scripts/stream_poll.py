@@ -65,7 +65,7 @@ def print_item(out: dict):
     elif s == "evaluating":
         if out.get("images") is not None:
             total = out.get("total") or "?"
-            print(f"[{ts()}] 📊 Test images evaluated: {out['images']}/{total}", flush=True)
+            print(f"[{ts()}] 📊 Downloading test set: {out['images']}/{total}", flush=True)
         else:
             print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
     elif s not in ("done", ""):

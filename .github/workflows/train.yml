@@ -35,7 +35,7 @@ jobs:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
           RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
-          GDRIVE_API_KEY: ${{ secrets.GDRIVE_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           DATASET_URL: ${{ vars.DATASET_URL }}
           REPO: ${{ github.repository }}
           EPOCHS: ${{ steps.config.outputs.epochs }}
@@ -53,7 +53,7 @@ jobs:
             -d "{
               \"input\": {
                 \"dataset_url\":      \"${DATASET_URL}\",
-                \"gdrive_api_key\":   \"${GDRIVE_API_KEY}\",
+                \"hf_token\":         \"${HF_TOKEN}\",
                 \"epochs\":           ${EPOCHS},
                 \"base_model\":       \"${BASE_MODEL}\",
                 \"imgsz\":            ${IMGSZ},
