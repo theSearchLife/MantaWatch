@@ -204,13 +204,10 @@ def _download_hf_dataset(repo_id: str, dest: str, token, patterns: list):
     """Download dataset files matching `patterns` from a HF dataset repo into `dest`.
 
     Uses the HF Hub CDN with parallel workers — no per-file quota or confirmation
-    pages (unlike Google Drive). hf_transfer is enabled when available for speed.
+    pages (unlike Google Drive). hf_transfer is deliberately NOT used: it speeds up
+    single large files but hangs on many small files (it stalled at ~1000 of 8099).
     """
-    try:
-        import hf_transfer  # noqa: F401
-        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-    except Exception:
-        pass
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     from huggingface_hub import snapshot_download
     snapshot_download(
         repo_id=repo_id, repo_type="dataset", local_dir=dest,
