@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 import zipfile
 
 import matplotlib
@@ -39,6 +40,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import runpod
+
+# cuBLAS workspace + filter silence ultralytics' per-step determinism warning
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+warnings.filterwarnings("ignore", message="Deterministic behavior was enabled")
 
 DEFAULT_DATASET_URL = "https://drive.google.com/uc?id=1SfFNtGMKP0dkqEqLAQNJT76_vP7LVwkC"
 PROGRESS_INTERVAL = 5
@@ -91,7 +96,7 @@ def log_mem(tag: str):
         log(f"  [mem] {tag}: {usage} MB used{detail}")
 
 
-def _start_mem_logger(interval: int = 15):
+def _start_mem_logger(interval: int = 300):
     """Log cgroup memory every `interval`s on a daemon thread. Returns a stop Event."""
     stop = threading.Event()
 
@@ -289,7 +294,7 @@ def _download_drive_items(items: list, dest: str, token: str, progress_cb=None):
         with lock:
             counts["done"] += 1
             done = counts["done"]
-        if done % 200 == 0 and progress_cb:
+        if done % 500 == 0 and progress_cb:
             progress_cb(done, len(items))
 
     with ThreadPoolExecutor(DOWNLOAD_THREADS) as pool:
