@@ -60,6 +60,12 @@ def print_item(out: dict):
             print(f"[{ts()}] 📥 Dataset images downloaded: {out['images']}/{total}", flush=True)
         else:
             print(f"[{ts()}] 📥 Downloading dataset...", flush=True)
+    elif s == "resizing":
+        if out.get("images") is not None:
+            total = out.get("total") or "?"
+            print(f"[{ts()}] 🪄 Resizing images: {out['images']}/{total}", flush=True)
+        else:
+            print(f"[{ts()}] 🪄 Resizing images...", flush=True)
     elif s == "releasing":
         print(f"[{ts()}] 🚀 Creating GitHub release...", flush=True)
     elif s == "evaluating":

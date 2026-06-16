@@ -58,6 +58,8 @@ RUNS_DIR = "/tmp/runs"
 DOWNLOAD_THREADS = 16
 EVAL_CHUNK_SIZE = 100    # images per prediction group during eval
 EVAL_PREDICT_BATCH = 16  # images decoded into RAM at once during inference
+RESIZE_MAX_SIDE = 1024   # downsize long side before train/eval; Drive originals untouched
+RESIZE_THREADS = os.cpu_count() or 8
 
 
 def log(msg: str):
@@ -198,6 +200,60 @@ def _remove_corrupt_images(root: str) -> int:
             p.unlink(missing_ok=True)
             removed += 1
     return removed
+
+
+def _resize_one(path: pathlib.Path, max_side: int) -> bool:
+    from PIL import Image
+    try:
+        with Image.open(path) as im:
+            im.load()
+            w, h = im.size
+            fmt = im.format
+            if max(w, h) <= max_side:
+                return False
+            scale = max_side / float(max(w, h))
+            resized = im.resize(
+                (max(1, round(w * scale)), max(1, round(h * scale))), Image.BILINEAR
+            )
+        opts = {"quality": 90} if path.suffix.lower() in (".jpg", ".jpeg") else {}
+        resized.save(path, format=fmt, **opts)
+        return True
+    except Exception:
+        return False
+
+
+def _resize_images_inplace(root: str, max_side: int, progress_cb=None) -> int:
+    """Downscale every image under root so its long side is <= max_side, in place.
+
+    Source photos are multi-megapixel; decoding them each epoch is what pins the
+    CPU and starves the GPU. The model resizes to imgsz anyway, so shrinking once
+    turns a per-epoch full-res decode into a one-off cost. Returns images rewritten.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    exts = {".jpg", ".jpeg", ".png"}
+    paths = [p for p in pathlib.Path(root).rglob("*") if p.suffix.lower() in exts]
+    total = len(paths)
+    if not total:
+        return 0
+    log(f"  Resizing {total} images to <= {max_side}px (long side)...")
+
+    counts = {"done": 0, "shrunk": 0}
+    lock = threading.Lock()
+
+    def work(p):
+        shrunk = _resize_one(p, max_side)
+        with lock:
+            counts["done"] += 1
+            counts["shrunk"] += int(shrunk)
+            done = counts["done"]
+        if done % 500 == 0 and progress_cb:
+            progress_cb(done, total)
+
+    with ThreadPoolExecutor(RESIZE_THREADS) as pool:
+        list(pool.map(work, paths))
+    log(f"  Resized {counts['shrunk']}/{total} (others already small)")
+    return counts["shrunk"]
 
 
 def _gdrive_list_folder(folder_id: str, token: str) -> list:
@@ -663,6 +719,109 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
     }
 
 
+def _classify_params(imgsz: int):
+    """Mirror ultralytics' classification inference transform params, kept in sync
+    with the installed version where possible (falls back to its documented
+    defaults). Returns (mean, std, resize_shorter_side, crop_size).
+    """
+    import math
+    mean, std, crop_fraction = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 1.0
+    try:
+        from ultralytics.data import augment as A
+        mean = list(getattr(A, "DEFAULT_MEAN", mean))
+        std = list(getattr(A, "DEFAULT_STD", std))
+        crop_fraction = float(getattr(A, "DEFAULT_CROP_FRACTION", crop_fraction))
+    except Exception:
+        pass
+    return mean, std, int(math.floor(imgsz / crop_fraction)), imgsz
+
+
+def _decode_rgb_gpu(path: pathlib.Path, device):
+    """Decode to a uint8 RGB CHW tensor on device. JPEGs decode on the GPU (nvjpeg);
+    other formats or any decode failure fall back to CPU decode + copy.
+    """
+    from torchvision.io import read_file, decode_jpeg, decode_image, ImageReadMode
+    data = read_file(str(path))
+    if path.suffix.lower() in (".jpg", ".jpeg"):
+        try:
+            return decode_jpeg(data, mode=ImageReadMode.RGB, device=device)
+        except Exception:
+            pass
+    return decode_image(data, mode=ImageReadMode.RGB).to(device)
+
+
+def _eval_predict_gpu(model, paths, imgsz, params):
+    """Predict class probabilities with JPEG decode + resize on the GPU."""
+    import torch
+    try:
+        import torchvision.transforms.v2.functional as F
+    except Exception:
+        import torchvision.transforms.functional as F
+
+    mean, std, scale_size, crop = params
+    device = torch.device("cuda")
+    net = model.model.to(device).eval()
+    dtype = next(net.parameters()).dtype
+    out = []
+    for start in range(0, len(paths), EVAL_PREDICT_BATCH):
+        tensors = []
+        for p in paths[start:start + EVAL_PREDICT_BATCH]:
+            img = _decode_rgb_gpu(p, device)
+            img = F.resize(img, scale_size, antialias=True)
+            img = F.center_crop(img, [crop, crop])
+            img = F.normalize(img.to(dtype).div(255.0), mean, std)
+            tensors.append(img)
+        with torch.no_grad():
+            logits = net(torch.stack(tensors))
+        if isinstance(logits, (list, tuple)):
+            logits = logits[0]
+        probs = logits.softmax(1).float().cpu().numpy()
+        out.extend(probs[i] for i in range(probs.shape[0]))
+    return out
+
+
+def _eval_predict_canonical(model, paths, imgsz):
+    """Predict via ultralytics' standard pipeline (CPU JPEG decode)."""
+    out = []
+    for start in range(0, len(paths), EVAL_CHUNK_SIZE):
+        chunk = [str(p) for p in paths[start:start + EVAL_CHUNK_SIZE]]
+        for result in model.predict(source=chunk, imgsz=imgsz, batch=32,
+                                    verbose=False, stream=True):
+            out.append(result.probs.data.cpu().numpy())
+    return out
+
+
+def _eval_predict(model, paths, imgsz):
+    """Predict probabilities for all paths, preferring GPU decode.
+
+    The GPU path is verified against the canonical pipeline on a spread-out sample
+    first; if predictions disagree, or CUDA/nvjpeg is unavailable, the whole eval
+    falls back to the canonical path so the report's numbers stay trustworthy.
+    """
+    import numpy as np
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available")
+        params = _classify_params(imgsz)
+        stride = max(1, len(paths) // 64)
+        sample = paths[::stride][:64]
+        if not sample:
+            raise RuntimeError("no images")
+        gpu_s = _eval_predict_gpu(model, sample, imgsz, params)
+        cpu_s = _eval_predict_canonical(model, sample, imgsz)
+        flips = sum(int(np.argmax(g) != np.argmax(c)) for g, c in zip(gpu_s, cpu_s))
+        max_diff = max(float(np.abs(g - c).max()) for g, c in zip(gpu_s, cpu_s))
+        agree = 1 - flips / len(sample)
+        if agree >= 0.98 and max_diff < 0.05:
+            log(f"  GPU-decode parity OK (agree {agree:.0%}, max prob Δ {max_diff:.4f}) — GPU path")
+            return _eval_predict_gpu(model, paths, imgsz, params)
+        log(f"  GPU-decode parity off (agree {agree:.0%}, max Δ {max_diff:.4f}) — CPU fallback")
+    except Exception as exc:
+        log(f"  GPU-decode unavailable ({exc}) — CPU fallback")
+    return _eval_predict_canonical(model, paths, imgsz)
+
+
 def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     """Evaluate one model on an on-disk class-folder dataset (archive mode)."""
     import numpy as np
@@ -697,14 +856,8 @@ def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     if n_skip:
         log(f"  Skipped {n_skip} corrupt image(s)")
 
-    pred_labels, pred_probs = [], []
-    for start in range(0, len(valid_paths), EVAL_CHUNK_SIZE):
-        chunk = [str(p) for p in valid_paths[start:start + EVAL_CHUNK_SIZE]]
-        for result in model.predict(source=chunk, imgsz=imgsz, batch=32,
-                                    verbose=False, stream=True):
-            probs = result.probs.data.cpu().numpy()
-            pred_labels.append(model.names[int(np.argmax(probs))])
-            pred_probs.append(probs)
+    pred_probs = _eval_predict(model, valid_paths, imgsz)
+    pred_labels = [model.names[int(np.argmax(p))] for p in pred_probs]
 
     probs_arr = np.stack(pred_probs)
     errors = [
@@ -970,6 +1123,15 @@ def handler(job: dict):
         n_corrupt = _remove_corrupt_images(dataset_root)
         if n_corrupt:
             log(f"  Removed {n_corrupt} corrupt image(s)")
+
+        yield {"status": "resizing"}
+        log("==> Resizing training images...")
+        yield from _run_with_progress(
+            lambda progress_cb: _resize_images_inplace(
+                dataset_root, RESIZE_MAX_SIDE, progress_cb
+            ),
+            "resizing",
+        )
 
         # Eval source: folder mode downloads test/ at eval time; archive keeps test/.
         disk_test = os.path.join(dataset_root, "test")
