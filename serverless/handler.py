@@ -613,7 +613,7 @@ def _plot_confusion_matrix(cm, classes: list, title: str = "") -> str:
     im = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
     ax.set_xticks(range(len(classes)))
     ax.set_yticks(range(len(classes)))
-    ax.set_xticklabels(classes, rotation=25, ha="right")
+    ax.set_xticklabels(classes, rotation=0, ha="center")
     ax.set_yticklabels(classes)
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
@@ -679,7 +679,7 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
     """
     import numpy as np
     from sklearn.metrics import (
-        accuracy_score, precision_score, recall_score, f1_score,
+        accuracy_score, precision_score, recall_score, f1_score, fbeta_score,
         confusion_matrix as sk_cm, roc_auc_score, roc_curve,
     )
 
@@ -687,6 +687,7 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
     prec_arr = precision_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
     rec_arr = recall_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
     f1_arr = f1_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
+    f2_arr = fbeta_score(y_true, y_pred, beta=2, labels=classes, average=None, zero_division=0)
 
     y_bin = np.stack([(y_true == c).astype(int) for c in classes], axis=1)
     y_score = np.stack([probs_arr[:, name2idx[c]] for c in classes], axis=1)
@@ -704,6 +705,7 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
             "precision": round(float(prec_arr[i]) * 100, 2),
             "recall": round(float(rec_arr[i]) * 100, 2),
             "f1": round(float(f1_arr[i]) * 100, 2),
+            "f2": round(float(f2_arr[i]) * 100, 2),
             "auc": auc_per.get(cls),
             "support": int((y_true == cls).sum()),
         }
@@ -827,7 +829,30 @@ def _delta_fmt(new_val, prev_val):
     return "±0.00", "#888"
 
 
-def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> str:
+def _verdict_html(new_f2, prev_f2, released=True) -> str:
+    """Headline go/no-go verdict on the primary metric (F2 of the manta class),
+    including whether this model was released.
+    """
+    if new_f2 is None:
+        return ""
+    rel = "Released." if released else "Release skipped — previous model kept."
+    if prev_f2 is None:
+        return (f'<div class="verdict {"better" if released else "neutral"}">'
+                f'<b>Primary metric · F2 (manta): {new_f2:.2f}%</b><br>'
+                f'Baseline — no previous model. {rel}</div>')
+    delta = round(new_f2 - prev_f2, 2)
+    if delta > 0:
+        cls, msg = "better", f"✅ NEW is better (+{delta:.2f} pp)"
+    elif delta < 0:
+        cls, msg = "worse", f"⚠️ NEW is worse ({delta:.2f} pp)"
+    else:
+        cls, msg = "neutral", "➖ No change"
+    return (f'<div class="verdict {cls}">'
+            f'<b>Primary metric · F2 (manta): {prev_f2:.2f}% → {new_f2:.2f}%</b><br>'
+            f'{msg} · {rel}</div>')
+
+
+def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag, released=True) -> str:
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     prev_label = prev_tag or "—"
     classes = new_eval["classes"]
@@ -837,8 +862,8 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
         prev_str = f"{prev_val:.2f}" if prev_val is not None else "—"
         nv_str = f"{new_val:.2f}" if new_val is not None else "—"
         return (
-            f"<tr><td>{label}</td><td><b>{nv_str}</b></td>"
-            f"<td>{prev_str}</td>"
+            f"<tr><td>{label}</td><td>{prev_str}</td>"
+            f"<td><b>{nv_str}</b></td>"
             f'<td style="color:{d_col};font-weight:600">{d_str}</td></tr>'
         )
 
@@ -849,13 +874,16 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
         "Accuracy (%)", new_eval["accuracy"],
         prev_eval["accuracy"] if prev_eval else None,
     )
+    verdict = _verdict_html(
+        gp(new_eval, EVAL_MANTA_CLASS, "f2"), gp(prev_eval, EVAL_MANTA_CLASS, "f2"), released
+    )
 
     cls_rows = ""
     for cls in classes:
         sup = new_eval["per_class"].get(cls, {}).get("support", "?")
         rows = ""
         for key, label in [("precision", "Precision (%)"), ("recall", "Recall (%)"),
-                            ("f1", "F1 (%)"), ("auc", "AUC-ROC")]:
+                            ("f1", "F1 (%)"), ("f2", "F2 (%)"), ("auc", "AUC-ROC")]:
             nv = gp(new_eval, cls, key)
             pv = gp(prev_eval, cls, key)
             if nv is not None:
@@ -863,7 +891,7 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
         cls_rows += f"""
     <h3>{cls} <span style="font-weight:400;font-size:.85rem;color:#666">(n={sup})</span></h3>
     <table>
-      <thead><tr><th>Metric</th><th>New</th><th>Prev</th><th>Δ</th></tr></thead>
+      <thead><tr><th>Metric</th><th>Prev</th><th>New</th><th>Δ</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>"""
 
@@ -905,6 +933,10 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
     .badge {{display:inline-block;padding:1px 8px;border-radius:12px;font-size:.8rem;font-weight:600}}
     .new  {{background:#dafbe1;color:#116329}}
     .prev {{background:#eaeef2;color:#57606a}}
+    .verdict {{padding:12px 16px;border-radius:8px;margin:18px 0;font-size:1rem;border:1px solid}}
+    .verdict.better {{background:#dafbe1;border-color:#aceebb;color:#116329}}
+    .verdict.worse {{background:#ffebe9;border-color:#ff9e94;color:#a40e26}}
+    .verdict.neutral {{background:#eaeef2;border-color:#d0d7de;color:#57606a}}
     table {{border-collapse:collapse;width:100%;margin-top:6px;font-size:.9rem}}
     th,td {{padding:7px 12px;text-align:left;border-bottom:1px solid #d0d7de}}
     th {{background:#f6f8fa;font-weight:600}}
@@ -922,9 +954,11 @@ def generate_report_html(new_eval: dict, prev_eval, new_tag: str, prev_tag) -> s
     <span class="badge prev">prev</span>&nbsp;{prev_label}
   </p>
 
+  {verdict}
+
   <h2>Overall accuracy</h2>
   <table>
-    <thead><tr><th>Metric</th><th>New</th><th>Prev</th><th>Δ</th></tr></thead>
+    <thead><tr><th>Metric</th><th>Prev</th><th>New</th><th>Δ</th></tr></thead>
     <tbody>{overall}</tbody>
   </table>
 
@@ -1097,6 +1131,8 @@ def handler(job: dict):
         metrics_csv = last_metrics(run_name)
         release_url = None
         report_url = None
+        released = False
+        skip_reason = None
 
         # Free disk before eval. Folder mode re-fetches test/ separately, so the
         # whole train dir goes; archive mode keeps the bundled test/ on disk.
@@ -1107,14 +1143,10 @@ def handler(job: dict):
             shutil.rmtree(dataset_root, ignore_errors=True)
 
         if release_tag and github_token and repo:
-            yield {"status": "releasing", "tag": release_tag}
-            log(f"==> Creating GitHub release {release_tag}...")
-            release_url = create_github_release(best_pt, github_token, repo, release_tag)
-            log(f"  Release: {release_url}")
-
+            new_eval = prev_eval = prev_tag = None
             if have_eval:
-                # The release is already published; evaluation is best-effort.
-                # Any failure here is logged but must not abort the final result.
+                # Evaluate before releasing so the release can be gated on the
+                # primary metric. Eval is best-effort: failure here must not abort.
                 try:
                     yield {"status": "evaluating"}
                     if test_items is not None:
@@ -1139,24 +1171,49 @@ def handler(job: dict):
                     _free_torch_memory()
 
                     prev_path, prev_tag = get_previous_model(github_token, repo, release_tag)
-                    prev_eval = None
                     if prev_path:
                         log("==> Evaluating previous model...")
                         prev_eval = run_full_eval(prev_path, test_dir, imgsz)
                         _free_torch_memory()
-
-                    log("==> Generating and publishing report...")
-                    html = generate_report_html(new_eval, prev_eval, release_tag, prev_tag)
-                    report_url = publish_to_gh_pages(html, github_token, repo, release_tag)
-                    log(f"  Report: {report_url}")
                     shutil.rmtree(EVAL_DIR, ignore_errors=True)
                 except Exception as eval_exc:
                     import traceback
-                    log(f"  WARNING: evaluation/report failed — {eval_exc}")
+                    log(f"  WARNING: evaluation failed — {eval_exc}")
                     log(traceback.format_exc())
-                    log("  Release succeeded; continuing without report.")
             else:
-                log("  No test/ split — skipping evaluation report")
+                log("  No test/ split — cannot evaluate; releasing without quality gate")
+
+            # Quality gate: skip the release only when we can prove the new model is
+            # worse than the previous one on the primary metric (F2 of manta). No
+            # previous model, or a missing metric, leaves nothing to fail against, so
+            # the model is released.
+            mc = EVAL_MANTA_CLASS
+            new_f2 = (new_eval or {}).get("per_class", {}).get(mc, {}).get("f2")
+            prev_f2 = (prev_eval or {}).get("per_class", {}).get(mc, {}).get("f2")
+            if new_f2 is not None and prev_f2 is not None and new_f2 < prev_f2:
+                skip_reason = (f"F2(manta) {new_f2:.2f}% < prev {prev_f2:.2f}% "
+                               f"({prev_tag or 'prev'})")
+
+            if skip_reason:
+                log(f"==> Release SKIPPED — new model worse: {skip_reason}")
+            else:
+                yield {"status": "releasing", "tag": release_tag}
+                log(f"==> Creating GitHub release {release_tag}...")
+                release_url = create_github_release(best_pt, github_token, repo, release_tag)
+                released = True
+                log(f"  Release: {release_url}")
+
+            if new_eval is not None:
+                # Publish the report regardless of the gate, so the decision is visible.
+                try:
+                    log("==> Generating and publishing report...")
+                    html = generate_report_html(new_eval, prev_eval, release_tag, prev_tag, released)
+                    report_url = publish_to_gh_pages(html, github_token, repo, release_tag)
+                    log(f"  Report: {report_url}")
+                except Exception as report_exc:
+                    import traceback
+                    log(f"  WARNING: report publish failed — {report_exc}")
+                    log(traceback.format_exc())
         else:
             log("  Skipping release and report (no tag/token/repo)")
 
@@ -1167,6 +1224,8 @@ def handler(job: dict):
             "metrics_last_line": metrics_csv,
             "release_url": release_url,
             "report_url": report_url,
+            "released": released,
+            "skip_reason": skip_reason,
         }
 
     except Exception as exc:

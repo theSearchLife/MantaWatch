@@ -117,7 +117,10 @@ def main():
                 final = find_final(final_data.get("output"))
                 print(f"[{ts()}] ✅ Training completed successfully.", flush=True)
                 print(f"  Model size : {final.get('model_size_mb', '—')} MB", flush=True)
-                print(f"  Release    : {final.get('release_url', '—')}", flush=True)
+                if final.get("released") is False and final.get("skip_reason"):
+                    print(f"  Release    : SKIPPED — {final.get('skip_reason')}", flush=True)
+                else:
+                    print(f"  Release    : {final.get('release_url', '—')}", flush=True)
                 if final.get("report_url"):
                     print(f"  Report     : {final.get('report_url')}", flush=True)
                 sys.exit(0)
