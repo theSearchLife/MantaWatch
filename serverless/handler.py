@@ -1192,7 +1192,6 @@ def handler(job: dict):
                         log("==> Evaluating previous model...")
                         prev_eval = run_full_eval(prev_path, test_dir, imgsz)
                         _free_torch_memory()
-                    shutil.rmtree(EVAL_DIR, ignore_errors=True)
                 except Exception as eval_exc:
                     import traceback
                     log(f"  WARNING: evaluation failed — {eval_exc}")
@@ -1231,6 +1230,7 @@ def handler(job: dict):
                     import traceback
                     log(f"  WARNING: report publish failed — {report_exc}")
                     log(traceback.format_exc())
+            shutil.rmtree(EVAL_DIR, ignore_errors=True)
         else:
             log("  Skipping release and report (no tag/token/repo)")
 
