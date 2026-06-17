@@ -720,20 +720,32 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
 
 
 def _classify_params(imgsz: int):
-    """Mirror ultralytics' classification inference transform params, kept in sync
-    with the installed version where possible (falls back to its documented
-    defaults). Returns (mean, std, resize_shorter_side, crop_size).
+    """Read the exact inference transform from ultralytics' own classify_transforms
+    so the GPU path matches the canonical pipeline instead of guessing mean/std/crop.
+    Returns (mean, std, resize_shorter_side, crop_size).
     """
-    import math
-    mean, std, crop_fraction = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 1.0
+    mean, std, scale_size, crop = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], imgsz, imgsz
     try:
-        from ultralytics.data import augment as A
-        mean = list(getattr(A, "DEFAULT_MEAN", mean))
-        std = list(getattr(A, "DEFAULT_STD", std))
-        crop_fraction = float(getattr(A, "DEFAULT_CROP_FRACTION", crop_fraction))
-    except Exception:
-        pass
-    return mean, std, int(math.floor(imgsz / crop_fraction)), imgsz
+        from ultralytics.data.augment import classify_transforms
+        tfm = classify_transforms(imgsz)
+        for t in getattr(tfm, "transforms", []):
+            name = type(t).__name__
+            if name == "Resize":
+                s = t.size
+                if isinstance(s, int):
+                    scale_size = s
+                else:
+                    s = list(s)
+                    scale_size = int(min(s)) if len(s) > 1 else int(s[0])
+            elif name == "CenterCrop":
+                c = t.size
+                crop = int(c[0]) if isinstance(c, (tuple, list)) else int(c)
+            elif name == "Normalize":
+                mean, std = list(t.mean), list(t.std)
+        log(f"  Eval transform: resize {scale_size}, crop {crop}, mean {mean}, std {std}")
+    except Exception as exc:
+        log(f"  classify transform introspection failed ({exc}) — using defaults")
+    return mean, std, scale_size, crop
 
 
 def _decode_rgb_gpu(path: pathlib.Path, device):
