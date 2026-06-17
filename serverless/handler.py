@@ -61,6 +61,10 @@ EVAL_PREDICT_BATCH = 16  # images decoded into RAM at once during inference
 RESIZE_MAX_SIDE = 1024   # downsize long side before train/eval; Drive originals untouched
 RESIZE_THREADS = os.cpu_count() or 8
 
+EVAL_MANTA_CLASS = "manta"
+EVAL_NON_MANTA_CLASS = "non_manta"
+EVAL_REPORT_CLASSES = [EVAL_MANTA_CLASS, EVAL_NON_MANTA_CLASS]
+
 
 def log(msg: str):
     print(msg, flush=True)
@@ -677,14 +681,13 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
         accuracy_score, precision_score, recall_score, f1_score,
         confusion_matrix as sk_cm, roc_auc_score, roc_curve,
     )
-    from sklearn.preprocessing import label_binarize
 
     accuracy = round(float(accuracy_score(y_true, y_pred)) * 100, 2)
     prec_arr = precision_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
     rec_arr = recall_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
     f1_arr = f1_score(y_true, y_pred, labels=classes, average=None, zero_division=0)
 
-    y_bin = label_binarize(y_true, classes=classes)
+    y_bin = np.stack([(y_true == c).astype(int) for c in classes], axis=1)
     y_score = np.stack([probs_arr[:, name2idx[c]] for c in classes], axis=1)
     auc_per, fpr_tpr = {}, {}
     for i, cls in enumerate(classes):
@@ -834,6 +837,13 @@ def _eval_predict(model, paths, imgsz):
     return _eval_predict_canonical(model, paths, imgsz)
 
 
+def _to_report_class(name: str) -> str:
+    """Collapse the model's native classes to the 2 report classes: anything that is
+    not 'manta' (other_fish, non_fish, ...) becomes 'non_manta'.
+    """
+    return EVAL_MANTA_CLASS if str(name).lower() == EVAL_MANTA_CLASS else EVAL_NON_MANTA_CLASS
+
+
 def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     """Evaluate one model on an on-disk class-folder dataset (archive mode)."""
     import numpy as np
@@ -841,8 +851,6 @@ def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     from ultralytics import YOLO
 
     model = YOLO(model_path)
-    classes = list(model.names.values())
-    name2idx = {v: k for k, v in model.names.items()}
 
     IMG_EXTS = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
     image_paths, gt_labels = [], []
@@ -869,9 +877,22 @@ def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
         log(f"  Skipped {n_skip} corrupt image(s)")
 
     pred_probs = _eval_predict(model, valid_paths, imgsz)
-    pred_labels = [model.names[int(np.argmax(p))] for p in pred_probs]
+    probs_3 = np.stack(pred_probs)  # (N, n_model_classes), model-index order
 
-    probs_arr = np.stack(pred_probs)
+    # Report eval is binary: manta vs non_manta. Hard prediction is the model's
+    # top-1 over its native classes, relabelled (manta -> manta; other_fish /
+    # non_fish -> non_manta). probs_arr aggregates the native probabilities into the
+    # 2 report classes only for the ROC/AUC scores.
+    name2idx = {c: i for i, c in enumerate(EVAL_REPORT_CLASSES)}
+    probs_arr = np.zeros((probs_3.shape[0], len(EVAL_REPORT_CLASSES)), dtype=probs_3.dtype)
+    for j in range(probs_3.shape[1]):
+        probs_arr[:, name2idx[_to_report_class(model.names[j])]] += probs_3[:, j]
+
+    classes = EVAL_REPORT_CLASSES
+    valid_labels = [_to_report_class(lbl) for lbl in valid_labels]
+    pred_labels = [_to_report_class(model.names[int(np.argmax(probs_3[i]))])
+                   for i in range(probs_3.shape[0])]
+
     errors = [
         (valid_paths[i], valid_labels[i], pred_labels[i], probs_arr[i])
         for i in range(len(valid_paths)) if valid_labels[i] != pred_labels[i]
@@ -879,7 +900,7 @@ def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
     errors.sort(key=lambda x: -float(x[3][name2idx.get(x[2], 0)]))
     ev = _eval_metrics(np.array(valid_labels), np.array(pred_labels),
                        probs_arr, classes, name2idx, errors[:12])
-    log(f"  Accuracy: {ev['accuracy']}%  errors: {ev['n_errors']}/{ev['total']}")
+    log(f"  Accuracy (manta vs non_manta): {ev['accuracy']}%  errors: {ev['n_errors']}/{ev['total']}")
     return ev
 
 
