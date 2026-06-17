@@ -56,9 +56,8 @@ PREV_MODEL = "/tmp/model_prev.pt"
 RUNS_DIR = "/tmp/runs"
 
 DOWNLOAD_THREADS = 16
-EVAL_CHUNK_SIZE = 100    # images per prediction group during eval
 EVAL_PREDICT_BATCH = 16  # inference batch size during eval
-EVAL_DECODE_THREADS = os.cpu_count() or 8  # parallel JPEG decode during eval
+EVAL_LOADER_WORKERS = min(8, os.cpu_count() or 4)  # DataLoader workers for eval preprocessing
 RESIZE_MAX_SIDE = 1024   # downsize long side before train/eval; Drive originals untouched
 RESIZE_THREADS = os.cpu_count() or 8
 
@@ -726,28 +725,46 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
 
 
 def _eval_predict(model, paths, imgsz):
-    """Predict class probabilities, decoding images in parallel across CPU cores.
+    """Predict class probabilities, parallelising preprocessing across worker procs.
 
-    ultralytics' predict decodes a path list serially (one core); for full-resolution
-    photos that single-threaded JPEG decode dominates eval time. We decode each chunk
-    in parallel and hand the BGR arrays to predict, which applies its own unchanged
-    preprocessing — so results match a path-based predict exactly, just faster.
+    ultralytics' predict preprocesses its source serially on one core, so for
+    full-resolution photos the per-image decode+resize dominates eval. We push the
+    images through a torch DataLoader (num_workers) using ultralytics' own
+    classification transform, then run batched GPU inference. Same transform and math
+    as predict (identical probabilities) — only the heavy preprocessing is parallel.
     """
     import cv2
     import numpy as np
-    from concurrent.futures import ThreadPoolExecutor
+    import torch
+    from torch.utils.data import Dataset, DataLoader
+    from PIL import Image
+    from ultralytics.data.augment import classify_transforms
 
-    def read(p):
-        im = cv2.imread(str(p))
-        return im if im is not None else np.zeros((32, 32, 3), dtype=np.uint8)
+    tfm = classify_transforms(imgsz)
 
+    class _EvalDS(Dataset):
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, i):
+            bgr = cv2.imread(str(paths[i]))
+            if bgr is None:
+                bgr = np.zeros((32, 32, 3), dtype=np.uint8)
+            return tfm(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+
+    loader = DataLoader(_EvalDS(), batch_size=EVAL_PREDICT_BATCH, shuffle=False,
+                        num_workers=EVAL_LOADER_WORKERS)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    net = model.model.to(device).eval()
+    dtype = next(net.parameters()).dtype
     out = []
-    with ThreadPoolExecutor(EVAL_DECODE_THREADS) as pool:
-        for start in range(0, len(paths), EVAL_CHUNK_SIZE):
-            arrays = list(pool.map(read, paths[start:start + EVAL_CHUNK_SIZE]))
-            for result in model.predict(source=arrays, imgsz=imgsz,
-                                        batch=EVAL_PREDICT_BATCH, verbose=False, stream=True):
-                out.append(result.probs.data.cpu().numpy())
+    for batch in loader:
+        with torch.no_grad():
+            logits = net(batch.to(device=device, dtype=dtype))
+        if isinstance(logits, (list, tuple)):
+            logits = logits[0]
+        for row in logits.softmax(1).float().cpu().numpy():
+            out.append(row)
     return out
 
 
