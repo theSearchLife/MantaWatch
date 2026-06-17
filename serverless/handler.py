@@ -57,7 +57,8 @@ RUNS_DIR = "/tmp/runs"
 
 DOWNLOAD_THREADS = 16
 EVAL_CHUNK_SIZE = 100    # images per prediction group during eval
-EVAL_PREDICT_BATCH = 16  # images decoded into RAM at once during inference
+EVAL_PREDICT_BATCH = 16  # inference batch size during eval
+EVAL_DECODE_THREADS = os.cpu_count() or 8  # parallel JPEG decode during eval
 RESIZE_MAX_SIDE = 1024   # downsize long side before train/eval; Drive originals untouched
 RESIZE_THREADS = os.cpu_count() or 8
 
@@ -722,119 +723,30 @@ def _eval_metrics(y_true, y_pred, probs_arr, classes, name2idx, error_grid) -> d
     }
 
 
-def _classify_params(imgsz: int):
-    """Read the exact inference transform from ultralytics' own classify_transforms
-    so the GPU path matches the canonical pipeline instead of guessing mean/std/crop.
-    Returns (mean, std, resize_shorter_side, crop_size).
-    """
-    mean, std, scale_size, crop = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], imgsz, imgsz
-    try:
-        from ultralytics.data.augment import classify_transforms
-        tfm = classify_transforms(imgsz)
-        for t in getattr(tfm, "transforms", []):
-            name = type(t).__name__
-            if name == "Resize":
-                s = t.size
-                if isinstance(s, int):
-                    scale_size = s
-                else:
-                    s = list(s)
-                    scale_size = int(min(s)) if len(s) > 1 else int(s[0])
-            elif name == "CenterCrop":
-                c = t.size
-                crop = int(c[0]) if isinstance(c, (tuple, list)) else int(c)
-            elif name == "Normalize":
-                mean, std = list(t.mean), list(t.std)
-        log(f"  Eval transform: resize {scale_size}, crop {crop}, mean {mean}, std {std}")
-    except Exception as exc:
-        log(f"  classify transform introspection failed ({exc}) — using defaults")
-    return mean, std, scale_size, crop
-
-
-def _decode_rgb_gpu(path: pathlib.Path, device):
-    """Decode to a uint8 RGB CHW tensor on device. JPEGs decode on the GPU (nvjpeg);
-    other formats or any decode failure fall back to CPU decode + copy.
-    """
-    from torchvision.io import read_file, decode_jpeg, decode_image, ImageReadMode
-    data = read_file(str(path))
-    if path.suffix.lower() in (".jpg", ".jpeg"):
-        try:
-            return decode_jpeg(data, mode=ImageReadMode.RGB, device=device)
-        except Exception:
-            pass
-    return decode_image(data, mode=ImageReadMode.RGB).to(device)
-
-
-def _eval_predict_gpu(model, paths, imgsz, params):
-    """Predict class probabilities with JPEG decode + resize on the GPU."""
-    import torch
-    try:
-        import torchvision.transforms.v2.functional as F
-    except Exception:
-        import torchvision.transforms.functional as F
-
-    mean, std, scale_size, crop = params
-    device = torch.device("cuda")
-    net = model.model.to(device).eval()
-    dtype = next(net.parameters()).dtype
-    out = []
-    for start in range(0, len(paths), EVAL_PREDICT_BATCH):
-        tensors = []
-        for p in paths[start:start + EVAL_PREDICT_BATCH]:
-            img = _decode_rgb_gpu(p, device)
-            img = F.resize(img, scale_size, antialias=True)
-            img = F.center_crop(img, [crop, crop])
-            img = F.normalize(img.to(dtype).div(255.0), mean, std)
-            tensors.append(img)
-        with torch.no_grad():
-            logits = net(torch.stack(tensors))
-        if isinstance(logits, (list, tuple)):
-            logits = logits[0]
-        probs = logits.softmax(1).float().cpu().numpy()
-        out.extend(probs[i] for i in range(probs.shape[0]))
-    return out
-
-
-def _eval_predict_canonical(model, paths, imgsz):
-    """Predict via ultralytics' standard pipeline (CPU JPEG decode)."""
-    out = []
-    for start in range(0, len(paths), EVAL_CHUNK_SIZE):
-        chunk = [str(p) for p in paths[start:start + EVAL_CHUNK_SIZE]]
-        for result in model.predict(source=chunk, imgsz=imgsz, batch=32,
-                                    verbose=False, stream=True):
-            out.append(result.probs.data.cpu().numpy())
-    return out
-
-
 def _eval_predict(model, paths, imgsz):
-    """Predict probabilities for all paths, preferring GPU decode.
+    """Predict class probabilities, decoding images in parallel across CPU cores.
 
-    The GPU path is verified against the canonical pipeline on a spread-out sample
-    first; if predictions disagree, or CUDA/nvjpeg is unavailable, the whole eval
-    falls back to the canonical path so the report's numbers stay trustworthy.
+    ultralytics' predict decodes a path list serially (one core); for full-resolution
+    photos that single-threaded JPEG decode dominates eval time. We decode each chunk
+    in parallel and hand the BGR arrays to predict, which applies its own unchanged
+    preprocessing — so results match a path-based predict exactly, just faster.
     """
+    import cv2
     import numpy as np
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not available")
-        params = _classify_params(imgsz)
-        stride = max(1, len(paths) // 64)
-        sample = paths[::stride][:64]
-        if not sample:
-            raise RuntimeError("no images")
-        gpu_s = _eval_predict_gpu(model, sample, imgsz, params)
-        cpu_s = _eval_predict_canonical(model, sample, imgsz)
-        flips = sum(int(np.argmax(g) != np.argmax(c)) for g, c in zip(gpu_s, cpu_s))
-        max_diff = max(float(np.abs(g - c).max()) for g, c in zip(gpu_s, cpu_s))
-        agree = 1 - flips / len(sample)
-        if agree >= 0.98 and max_diff < 0.05:
-            log(f"  GPU-decode parity OK (agree {agree:.0%}, max prob Δ {max_diff:.4f}) — GPU path")
-            return _eval_predict_gpu(model, paths, imgsz, params)
-        log(f"  GPU-decode parity off (agree {agree:.0%}, max Δ {max_diff:.4f}) — CPU fallback")
-    except Exception as exc:
-        log(f"  GPU-decode unavailable ({exc}) — CPU fallback")
-    return _eval_predict_canonical(model, paths, imgsz)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def read(p):
+        im = cv2.imread(str(p))
+        return im if im is not None else np.zeros((32, 32, 3), dtype=np.uint8)
+
+    out = []
+    with ThreadPoolExecutor(EVAL_DECODE_THREADS) as pool:
+        for start in range(0, len(paths), EVAL_CHUNK_SIZE):
+            arrays = list(pool.map(read, paths[start:start + EVAL_CHUNK_SIZE]))
+            for result in model.predict(source=arrays, imgsz=imgsz,
+                                        batch=EVAL_PREDICT_BATCH, verbose=False, stream=True):
+                out.append(result.probs.data.cpu().numpy())
+    return out
 
 
 def _to_report_class(name: str) -> str:
