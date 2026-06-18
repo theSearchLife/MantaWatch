@@ -60,12 +60,18 @@ def print_item(out: dict):
             print(f"[{ts()}] 📥 Dataset images downloaded: {out['images']}/{total}", flush=True)
         else:
             print(f"[{ts()}] 📥 Downloading dataset...", flush=True)
+    elif s == "resizing":
+        if out.get("images") is not None:
+            total = out.get("total") or "?"
+            print(f"[{ts()}] 🪄 Resizing images: {out['images']}/{total}", flush=True)
+        else:
+            print(f"[{ts()}] 🪄 Resizing images...", flush=True)
     elif s == "releasing":
         print(f"[{ts()}] 🚀 Creating GitHub release...", flush=True)
     elif s == "evaluating":
         if out.get("images") is not None:
             total = out.get("total") or "?"
-            print(f"[{ts()}] 📊 Test images evaluated: {out['images']}/{total}", flush=True)
+            print(f"[{ts()}] 📊 Downloading test set: {out['images']}/{total}", flush=True)
         else:
             print(f"[{ts()}] 📊 Running model evaluation...", flush=True)
     elif s not in ("done", ""):
@@ -111,7 +117,10 @@ def main():
                 final = find_final(final_data.get("output"))
                 print(f"[{ts()}] ✅ Training completed successfully.", flush=True)
                 print(f"  Model size : {final.get('model_size_mb', '—')} MB", flush=True)
-                print(f"  Release    : {final.get('release_url', '—')}", flush=True)
+                if final.get("released") is False and final.get("skip_reason"):
+                    print(f"  Release    : SKIPPED — {final.get('skip_reason')}", flush=True)
+                else:
+                    print(f"  Release    : {final.get('release_url', '—')}", flush=True)
                 if final.get("report_url"):
                     print(f"  Report     : {final.get('report_url')}", flush=True)
                 sys.exit(0)

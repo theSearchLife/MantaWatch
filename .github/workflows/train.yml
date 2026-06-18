@@ -35,7 +35,7 @@ jobs:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
           RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
-          GDRIVE_API_KEY: ${{ secrets.GDRIVE_API_KEY }}
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
           DATASET_URL: ${{ vars.DATASET_URL }}
           REPO: ${{ github.repository }}
           EPOCHS: ${{ steps.config.outputs.epochs }}
@@ -46,6 +46,9 @@ jobs:
         run: |
           RELEASE_TAG=$(date +%Y-%m-%d)
 
+          # base64-encode the service-account JSON so it embeds cleanly in the payload
+          DRIVE_SA_B64=$(printf '%s' "${GDRIVE_SA_KEY}" | base64 -w0)
+
           # Submit job
           RESPONSE=$(curl -s -X POST "https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/run" \
             -H "Content-Type: application/json" \
@@ -53,7 +56,7 @@ jobs:
             -d "{
               \"input\": {
                 \"dataset_url\":      \"${DATASET_URL}\",
-                \"gdrive_api_key\":   \"${GDRIVE_API_KEY}\",
+                \"drive_sa_b64\":     \"${DRIVE_SA_B64}\",
                 \"epochs\":           ${EPOCHS},
                 \"base_model\":       \"${BASE_MODEL}\",
                 \"imgsz\":            ${IMGSZ},
