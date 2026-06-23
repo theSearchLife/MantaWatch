@@ -549,9 +549,10 @@ def create_github_release(model_path: str, token: str, repo: str, tag: str, imgs
         }, timeout=30,
     )
     resp.raise_for_status()
-    upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
+    release = resp.json()
+    upload_url = release["upload_url"].replace("{?name,label}", "")
 
-    def upload(path: str, name: str) -> str:
+    def upload(path: str, name: str):
         with open(path, "rb") as f:
             up = requests.post(
                 f"{upload_url}?name={name}",
@@ -559,9 +560,8 @@ def create_github_release(model_path: str, token: str, repo: str, tag: str, imgs
                 data=f, timeout=180,
             )
         up.raise_for_status()
-        return up.json()["browser_download_url"]
 
-    pt_url = upload(model_path, "model.pt")
+    upload(model_path, "model.pt")
 
     # ONNX is best-effort: the .pt release already succeeded, so a failed export
     # must not abort the release.
@@ -572,7 +572,7 @@ def create_github_release(model_path: str, token: str, repo: str, tag: str, imgs
     except Exception as exc:
         log(f"  WARNING: ONNX export/upload failed — {exc}")
 
-    return pt_url
+    return release["html_url"]
 
 
 def get_previous_model(token: str, repo: str, current_tag: str):
