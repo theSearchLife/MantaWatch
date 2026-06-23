@@ -524,7 +524,13 @@ def _gh_headers(token: str) -> dict:
     }
 
 
-def create_github_release(model_path: str, token: str, repo: str, tag: str) -> str:
+def _export_onnx(model_path: str, imgsz: int) -> str:
+    """Export the trained .pt to ONNX (class names + imgsz embedded in metadata)."""
+    from ultralytics import YOLO
+    return str(YOLO(model_path).export(format="onnx", imgsz=imgsz))
+
+
+def create_github_release(model_path: str, token: str, repo: str, tag: str, imgsz: int = 640) -> str:
     import requests
     headers = _gh_headers(token)
     base = f"https://api.github.com/repos/{repo}"
@@ -544,14 +550,29 @@ def create_github_release(model_path: str, token: str, repo: str, tag: str) -> s
     )
     resp.raise_for_status()
     upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
-    with open(model_path, "rb") as f:
-        up = requests.post(
-            f"{upload_url}?name=model.pt",
-            headers={**headers, "Content-Type": "application/octet-stream"},
-            data=f, timeout=120,
-        )
-    up.raise_for_status()
-    return up.json()["browser_download_url"]
+
+    def upload(path: str, name: str) -> str:
+        with open(path, "rb") as f:
+            up = requests.post(
+                f"{upload_url}?name={name}",
+                headers={**headers, "Content-Type": "application/octet-stream"},
+                data=f, timeout=180,
+            )
+        up.raise_for_status()
+        return up.json()["browser_download_url"]
+
+    pt_url = upload(model_path, "model.pt")
+
+    # ONNX is best-effort: the .pt release already succeeded, so a failed export
+    # must not abort the release.
+    try:
+        onnx_path = _export_onnx(model_path, imgsz)
+        upload(onnx_path, "model.onnx")
+        log("  Uploaded model.onnx")
+    except Exception as exc:
+        log(f"  WARNING: ONNX export/upload failed — {exc}")
+
+    return pt_url
 
 
 def get_previous_model(token: str, repo: str, current_tag: str):
@@ -1215,7 +1236,7 @@ def handler(job: dict):
             else:
                 yield {"status": "releasing", "tag": release_tag}
                 log(f"==> Creating GitHub release {release_tag}...")
-                release_url = create_github_release(best_pt, github_token, repo, release_tag)
+                release_url = create_github_release(best_pt, github_token, repo, release_tag, imgsz)
                 released = True
                 log(f"  Release: {release_url}")
 
