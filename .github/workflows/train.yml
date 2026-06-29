@@ -37,6 +37,7 @@ jobs:
           RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
           DATASET_URL: ${{ vars.DATASET_URL }}
+          CLASSES: ${{ vars.CLASSES }}
           REPO: ${{ github.repository }}
           EPOCHS: ${{ steps.config.outputs.epochs }}
           BASE_MODEL: ${{ steps.config.outputs.base_model }}
@@ -56,6 +57,7 @@ jobs:
             -d "{
               \"input\": {
                 \"dataset_url\":      \"${DATASET_URL}\",
+                \"classes\":          \"${CLASSES}\",
                 \"drive_sa_b64\":     \"${DRIVE_SA_B64}\",
                 \"epochs\":           ${EPOCHS},
                 \"base_model\":       \"${BASE_MODEL}\",
