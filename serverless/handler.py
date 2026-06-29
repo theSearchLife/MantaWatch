@@ -1,12 +1,11 @@
 """
-RunPod Serverless handler — YOLO manta classification training + evaluation.
+RunPod Serverless handler — YOLO image classification training + evaluation.
 
 Input:
-    dataset_url      : Drive folder link (with train/, val/, test/) or archive URL.
-                       Folder mode downloads train/+val/ for training, then test/
-                       for evaluation — all to disk via the Drive API.
-    drive_sa_b64     : base64-encoded service-account JSON; required for Drive
-                       folders (authenticated downloads avoid the API-key quota).
+    dataset_url      : Google Drive folder link (with train/, val/, test/ subfolders).
+    classes          : comma-separated class names, target first
+                       (e.g. "manta,other_fish,non_fish").
+    drive_sa_b64     : base64-encoded service-account JSON for authenticated Drive downloads.
     epochs           : int   (default 100)
     base_model       : str   (default "yolo11s-cls.pt")
     imgsz            : int   (default 640)
@@ -19,7 +18,7 @@ Input:
 
 Output (streaming):
     Yields epoch progress every PROGRESS_INTERVAL epochs, then final result dict.
-    { status, run_name, model_size_mb, metrics_last_line, release_url, report_url }
+    { status, run_name, model_size_mb, release_url, report_url, released, skip_reason }
 """
 import base64
 import datetime
@@ -28,12 +27,9 @@ import pathlib
 import queue
 import re
 import shutil
-import subprocess
-import tempfile
 import threading
 import time
 import warnings
-import zipfile
 
 import matplotlib
 matplotlib.use("Agg")
@@ -47,10 +43,8 @@ warnings.filterwarnings("ignore", message="Deterministic behavior was enabled")
 
 PROGRESS_INTERVAL = 5
 
-TRAIN_ARCHIVE = "/tmp/dataset_train.archive"
-TRAIN_DIR = "/tmp/dataset_train"   # archive-mode extraction root
-DATA_DIR = "/tmp/dataset"          # folder-mode: train/ + val/
-EVAL_DIR = "/tmp/dataset_eval"     # folder-mode: test/
+DATA_DIR = "/tmp/dataset"       # train/ + val/
+EVAL_DIR = "/tmp/dataset_eval"  # test/
 PREV_MODEL = "/tmp/model_prev.pt"
 RUNS_DIR = "/tmp/runs"
 
@@ -147,37 +141,6 @@ def _drive_token(sa_b64: str) -> str:
     )
     creds.refresh(Request())
     return creds.token
-
-
-def _download(url: str, dest: str):
-    if os.path.exists(dest):
-        os.remove(dest)
-    if "drive.google.com" in url:
-        m = re.search(r"(?:id=|/d/)([a-zA-Z0-9_-]{20,})", url)
-        file_id = m.group(1) if m else url
-        log(f"  Google Drive ID: {file_id}")
-        subprocess.run(["gdown", file_id, "-O", dest], check=True)
-    else:
-        log(f"  Direct download: {url}")
-        subprocess.run(["wget", "-q", url, "-O", dest], check=True)
-    log(f"  Downloaded: {os.path.getsize(dest) / 1024 / 1024:.0f} MB")
-
-
-def _extract(archive: str, dest: str):
-    if os.path.exists(dest):
-        shutil.rmtree(dest)
-    os.makedirs(dest)
-    with open(archive, "rb") as f:
-        magic = f.read(4).hex()
-    if magic.startswith("504b"):
-        log("  Detected ZIP")
-        with zipfile.ZipFile(archive) as zf:
-            zf.extractall(dest)
-    elif magic.startswith("1f8b"):
-        log("  Detected tar.gz")
-        subprocess.run(["tar", "xzf", archive, "-C", dest, "--no-same-owner"], check=True)
-    else:
-        raise RuntimeError(f"Unknown archive type (magic={magic})")
 
 
 def _remove_corrupt_images(root: str) -> int:
@@ -426,20 +389,6 @@ def _run_with_progress(fetch_fn, status: str):
     t.join()
     if error_holder[0]:
         raise error_holder[0]
-
-
-def find_train_root(extract_dir: str) -> str:
-    result = subprocess.run(
-        ["find", extract_dir, "-maxdepth", "3", "-type", "d", "-name", "train"],
-        capture_output=True, text=True,
-    )
-    dirs = [p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
-    if not dirs:
-        raise RuntimeError("No 'train' directory found in archive")
-    root = str(pathlib.Path(dirs[0]).parent)
-    log(f"  Dataset root: {root}")
-    log(f"  Classes: {os.listdir(os.path.join(root, 'train'))}")
-    return root
 
 
 def _train_with_progress(dataset_root, run_name, base_model, epochs, imgsz, batch, patience):
@@ -798,7 +747,7 @@ def _to_report_class(name: str) -> str:
 
 
 def run_full_eval(model_path: str, eval_root: str, imgsz: int = 640) -> dict:
-    """Evaluate one model on an on-disk class-folder dataset (archive mode)."""
+    """Evaluate one model on an on-disk class-folder dataset."""
     import numpy as np
     from PIL import Image as PILImage
     from ultralytics import YOLO
@@ -1120,48 +1069,32 @@ def handler(job: dict):
     drive_sa_b64 = inp.get("drive_sa_b64")  # base64 service-account JSON for Drive
 
     log(f"=== Job start: {run_name} ===")
-    try:
-        tmp_fs = subprocess.run(["stat", "-f", "-c", "%T", "/tmp"],
-                                capture_output=True, text=True).stdout.strip()
-        log(f"  /tmp filesystem: {tmp_fs or '?'}")
-    except Exception:
-        pass
     log_mem("job start")
     _start_mem_logger()
 
     try:
         shutil.rmtree(RUNS_DIR, ignore_errors=True)
 
-        # Drive folder (service-account auth) → download to disk; else archive URL.
         folder_id = _drive_folder_id(dataset_url)
-        test_items = None        # folder mode: [(file_id, rel)] under test/
-        drive_token = None
+        if not folder_id:
+            raise ValueError("dataset_url must be a Google Drive folder link")
+        if not drive_sa_b64:
+            raise ValueError("drive_sa_b64 (base64 service-account JSON) is required")
 
         yield {"status": "downloading"}
         log("==> Downloading dataset...")
-        if folder_id:
-            if not drive_sa_b64:
-                raise ValueError(
-                    "dataset_url is a Drive folder — the 'drive_sa_b64' input "
-                    "(base64 service-account JSON) is required"
-                )
-            drive_token = _drive_token(drive_sa_b64)
-            log("  Listing Drive folder (service account)...")
-            listing = _gdrive_list_folder(folder_id, drive_token)
-            train_items, test_items = _partition_drive_listing(listing)
-            log(f"  train/val: {len(train_items)} images · test: {len(test_items)} images")
-            yield from _run_with_progress(
-                lambda progress_cb: _download_drive_items(
-                    train_items, DATA_DIR, drive_token, progress_cb
-                ),
-                "downloading",
-            )
-            dataset_root = DATA_DIR
-        else:
-            _download(dataset_url, TRAIN_ARCHIVE)
-            _extract(TRAIN_ARCHIVE, TRAIN_DIR)
-            os.remove(TRAIN_ARCHIVE)
-            dataset_root = find_train_root(TRAIN_DIR)
+        drive_token = _drive_token(drive_sa_b64)
+        log("  Listing Drive folder (service account)...")
+        listing = _gdrive_list_folder(folder_id, drive_token)
+        train_items, test_items = _partition_drive_listing(listing)
+        log(f"  train/val: {len(train_items)} images · test: {len(test_items)} images")
+        yield from _run_with_progress(
+            lambda progress_cb: _download_drive_items(
+                train_items, DATA_DIR, drive_token, progress_cb
+            ),
+            "downloading",
+        )
+        dataset_root = DATA_DIR
 
         n_corrupt = _remove_corrupt_images(dataset_root)
         if n_corrupt:
@@ -1178,10 +1111,7 @@ def handler(job: dict):
             "resizing",
         )
 
-        # Eval source: folder mode downloads test/ at eval time; archive keeps test/.
-        disk_test = os.path.join(dataset_root, "test")
-        have_disk_test = not folder_id and os.path.isdir(disk_test)
-        have_eval = bool(test_items) or have_disk_test
+        have_eval = bool(test_items)
 
         log_mem("after download")
 
@@ -1200,13 +1130,9 @@ def handler(job: dict):
         released = False
         skip_reason = None
 
-        # Free disk before eval. Folder mode re-fetches test/ separately, so the
-        # whole train dir goes; archive mode keeps the bundled test/ on disk.
+        # Test is re-fetched separately at eval, so free the whole training set now.
         log("==> Removing training data from disk...")
-        for sub in ("train", "val"):
-            shutil.rmtree(os.path.join(dataset_root, sub), ignore_errors=True)
-        if not have_disk_test:
-            shutil.rmtree(dataset_root, ignore_errors=True)
+        shutil.rmtree(dataset_root, ignore_errors=True)
 
         if release_tag and github_token and repo:
             new_eval = prev_eval = prev_tag = None
@@ -1215,18 +1141,15 @@ def handler(job: dict):
                 # primary metric. Eval is best-effort: failure here must not abort.
                 try:
                     yield {"status": "evaluating"}
-                    if test_items is not None:
-                        log(f"==> Downloading test split ({len(test_items)} images)...")
-                        drive_token = _drive_token(drive_sa_b64)  # fresh token for this phase
-                        yield from _run_with_progress(
-                            lambda progress_cb: _download_drive_items(
-                                test_items, EVAL_DIR, drive_token, progress_cb
-                            ),
-                            "evaluating",
-                        )
-                        test_dir = os.path.join(EVAL_DIR, "test")
-                    else:
-                        test_dir = disk_test
+                    log(f"==> Downloading test split ({len(test_items)} images)...")
+                    drive_token = _drive_token(drive_sa_b64)  # fresh token for this phase
+                    yield from _run_with_progress(
+                        lambda progress_cb: _download_drive_items(
+                            test_items, EVAL_DIR, drive_token, progress_cb
+                        ),
+                        "evaluating",
+                    )
+                    test_dir = os.path.join(EVAL_DIR, "test")
                     n_corrupt = _remove_corrupt_images(test_dir)
                     if n_corrupt:
                         log(f"  Removed {n_corrupt} corrupt test image(s)")
