@@ -162,6 +162,8 @@ VRAM for training) → **Create endpoint**.
 - **Enable execution timeout**, **Execution timeout = 21600 sec** (6 h) — caps runaway
   training. It matches the GitHub Action's 6-hour limit; if 6 h isn't enough, something is
   wrong.
+- **Docker configuration → Container disk = 40 GB** — room for the dataset, resized
+  images, and model checkpoints (the default is too small).
 
 Finally, copy the endpoint's **Endpoint ID** into the `RUNPOD_ENDPOINT_ID` secret.
 
