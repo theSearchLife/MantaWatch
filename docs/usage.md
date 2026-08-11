@@ -32,6 +32,14 @@ my-dataset/
     └── non_fish/
 ```
 
+The three splits:
+
+- **`train/`** — the model learns from these; this set grows as you add images.
+- **`val/`** — held out from training and used *during* it to pick the best checkpoint
+  (the model is selected on its validation metrics).
+- **`test/`** — a separate held-out set used only to score the chosen model for the report.
+  **Keep it fixed** so each run is an apples-to-apples comparison with the previous model.
+
 To add images: open the relevant class folder in Google Drive and **drag the image files
 in** (or use Upload). For example, new confirmed manta photos go into `train/manta/`.
 

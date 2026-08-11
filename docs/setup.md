@@ -1,7 +1,11 @@
 # Setup guide
 
-One-time configuration, in the order you'd actually do it — grouped by service so you
-don't bounce between tabs. After this, training is one button-click (see
+**Start by making your own copy of this repository** — fork it, or click the green **Use
+this template** button — so its Actions, secrets, and container image live under your own
+account/org. Everything below configures that copy.
+
+The rest is one-time configuration, in the order you'd actually do it — grouped by service
+so you don't bounce between tabs. After this, training is one button-click (see
 [usage.md](usage.md)).
 
 By the end you'll have:
