@@ -35,12 +35,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image name (owner + target class)
+      - name: Compute image name
         id: img
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          TARGET=$(echo "${{ vars.CLASSES }}" | cut -d',' -f1 | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
-          echo "tag=ghcr.io/${OWNER}/${TARGET:-model}-train:latest" >> "$GITHUB_OUTPUT"
+          echo "tag=ghcr.io/${OWNER}/yolo-cls-trainer:latest" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v5

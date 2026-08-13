@@ -11,7 +11,7 @@ so you don't bounce between tabs. After this, training is one button-click (see
 By the end you'll have:
 
 - **4 GitHub secrets** — `RELEASE_GITHUB_TOKEN`, `GDRIVE_SA_KEY`, `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`
-- **2 GitHub variables** — `CLASSES`, `DATASET_URL`
+- **1 GitHub variable** — `DATASET_URL`
 - a worker image on GHCR, a configured RunPod endpoint, and GitHub Pages enabled.
 
 Secrets and variables both live under **Repo → Settings → Secrets and variables →
@@ -41,20 +41,7 @@ The worker uses this to create Releases and publish the report to `gh-pages`.
 
 3. Set an expiration, generate, and copy the token into the `RELEASE_GITHUB_TOKEN` secret.
 
-### 1b. Classes → variable `CLASSES`
-
-Comma-separated class names, **target class first** (e.g. `manta,other_fish,non_fish`).
-
-- The **first** entry is the target — the report is "target vs everything-else", scored
-  by **F2 of that class**.
-- Any number of classes works (one target + any number of others).
-- For another animal it might be `cuckoo,other_bird,non_bird`.
-- The names must exactly match the dataset's class folders ([Step 2a](#2a-create-the-dataset-folder)),
-  or the run fails fast with a clear error.
-
-![CLASSES variable](imgs/img4.png)
-
-### 1c. (First time only) Build the worker image
+### 1b. (First time only) Build the worker image
 
 The GPU worker runs the code in `serverless/`, packaged as a Docker image on GitHub
 Container Registry (GHCR).
@@ -64,10 +51,9 @@ Container Registry (GHCR).
 
    ![Run the Build & Push Docker Image workflow](imgs/img5.png)
 
-2. The image is named **`ghcr.io/<owner>/<target>-train:latest`** — automatically derived
-   from your repo owner and your **first class** (so set `CLASSES` in 1b first). For
-   `manta`, that's `ghcr.io/<owner>/manta-train:latest`. **Note this name — you'll paste it
-   into RunPod in [Step 3](#step-3--runpod).**
+2. The image is named **`ghcr.io/<owner>/yolo-cls-trainer:latest`** (your repo owner + a
+   fixed name — it's the same worker for any animal). **Note it — you'll paste it into
+   RunPod in [Step 3](#step-3--runpod).**
 3. **Permissions / visibility:**
    - After the first run the GHCR package is **private**. For RunPod to pull it, either
      **make it public** (your profile/org → **Packages** → the package → **Package settings
@@ -88,24 +74,30 @@ Do all the Google work in one go: dataset folder, service-account key, share, li
 
 ### 2a. Create the dataset folder
 
-One Drive folder with this shape — the same class subfolders (matching `CLASSES`) under
-each of `train/`, `val/`, `test/`:
+One Drive folder with `train/`, `val/`, `test/`, and the **same class subfolders** under
+each. The code figures out the classes from these folder names by a simple convention:
+
+- the **target** class folder is prefixed **`the_`** (e.g. `the_manta`),
+- every other class folder is prefixed **`other_`** or **`non_`**.
 
 ```
 my-dataset/                ← this folder's link becomes DATASET_URL
 ├── train/
-│   ├── manta/
+│   ├── the_manta/         ← target (prefixed the_)
 │   ├── other_fish/
 │   └── non_fish/
 ├── val/
-│   ├── manta/
+│   ├── the_manta/
 │   ├── other_fish/
 │   └── non_fish/
 └── test/
-    ├── manta/
+    ├── the_manta/
     ├── other_fish/
     └── non_fish/
 ```
+
+There's no classes variable to set. The report becomes "manta vs non_manta" (the target vs
+everything else), scored by F2 of the target.
 
 ### 2b. Service account + key → secret `GDRIVE_SA_KEY`
 
@@ -153,8 +145,8 @@ Open **[console.runpod.io/user/settings](https://console.runpod.io/user/settings
 
 **Create it:** Serverless → **+ New Endpoint** → **Custom deployment** → **Deploy from
 Docker registry or a template** → **Container image** = the name from
-[Step 1c](#1c-first-time-only-build-the-worker-image) (e.g.
-`ghcr.io/<owner>/manta-train:latest`; add registry credentials here if the package is
+[Step 1b](#1b-first-time-only-build-the-worker-image) (e.g.
+`ghcr.io/<owner>/yolo-cls-trainer:latest`; add registry credentials here if the package is
 private) → **Configure endpoint** → **GPU configuration = 24 GB (Pro)** (important — enough
 VRAM for training) → **Create endpoint**.
 
@@ -197,9 +189,9 @@ The report URL is then `https://<owner>.github.io/<repo>/`.
 ### 4b. Final checklist
 
 - [ ] Secrets: `RELEASE_GITHUB_TOKEN`, `GDRIVE_SA_KEY`, `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`
-- [ ] Variables: `CLASSES`, `DATASET_URL`
+- [ ] Variable: `DATASET_URL`
 - [ ] Worker image built and reachable by RunPod (public, or creds added)
-- [ ] Drive folder structured `train/val/test` → class subfolders matching `CLASSES`
+- [ ] Drive folder structured `train/val/test` → class subfolders (target prefixed `the_`, rest `other_`/`non_`)
 - [ ] Drive folder shared with the service-account email
 - [ ] RunPod endpoint created; ID in `RUNPOD_ENDPOINT_ID`
 - [ ] GitHub Pages enabled on `gh-pages`
@@ -212,11 +204,11 @@ You're ready — see [usage.md](usage.md) to run training.
 
 Everything animal-specific is configuration, so switching targets is:
 
-1. Put the new dataset in a Drive folder (same `train/val/test` + class-subfolder shape);
-   share it with the service account; set `DATASET_URL` to its link.
-2. Set `CLASSES` to the new classes, target first (e.g. `cuckoo,other_bird,non_bird`).
-3. Re-run **Build & Push Docker Image** — the image name follows the new target
-   (`ghcr.io/<owner>/cuckoo-train:latest`); point the RunPod endpoint at it.
+1. Put the new dataset in a Drive folder (same `train/val/test` shape, with the target
+   folder prefixed `the_` — e.g. `the_cuckoo` — and the rest `other_`/`non_`); share it
+   with the service account; set `DATASET_URL` to its link.
+2. Run training. The worker image is animal-neutral, so there's nothing to rebuild and no
+   endpoint change.
 
 No code changes. (Re-branding the report title is a separate, optional change.)
 

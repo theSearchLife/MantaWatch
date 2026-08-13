@@ -19,15 +19,15 @@ each with the same one-subfolder-per-class layout:
 ```
 my-dataset/
 ├── train/                  ← model learns from these (grows over time)
-│   ├── manta/
+│   ├── the_manta/
 │   ├── other_fish/
 │   └── non_fish/
 ├── val/                    ← used during training to pick the best checkpoint
-│   ├── manta/
+│   ├── the_manta/
 │   ├── other_fish/
 │   └── non_fish/
 └── test/                   ← used to score the model for the report — keep FIXED
-    ├── manta/
+    ├── the_manta/
     ├── other_fish/
     └── non_fish/
 ```
@@ -41,7 +41,7 @@ The three splits:
   **Keep it fixed** so each run is an apples-to-apples comparison with the previous model.
 
 To add images: open the relevant class folder in Google Drive and **drag the image files
-in** (or use Upload). For example, new confirmed manta photos go into `train/manta/`.
+in** (or use Upload). For example, new confirmed manta photos go into `train/the_manta/`.
 
 Guidelines:
 
@@ -49,8 +49,8 @@ Guidelines:
 - **Keep `test/` (and ideally `val/`) fixed** between runs. The report compares the new
   model against the previous one on the test set — if the test set changes, the comparison
   isn't apples-to-apples.
-- The class folder names must match the `CLASSES` variable exactly. If you add a new class,
-  update `CLASSES` too (target class stays first).
+- Keep the target folder prefixed `the_` and the rest `other_`/`non_`. To add a class,
+  just create the folder under each split — there's no variable to keep in sync.
 
 ---
 
@@ -123,7 +123,7 @@ two files:
 
 | Symptom | Cause / fix |
 |---|---|
-| Run fails almost immediately with `Dataset classes [...] do not match configured CLASSES [...]` | The Drive class folders and the `CLASSES` variable differ. Make them identical (names + set). |
+| Run fails almost immediately with `Expected exactly one target folder prefixed 'the_' ...` | No class folder (or more than one) is prefixed `the_`. Name exactly one folder `the_<animal>` and prefix the rest `other_`/`non_`. |
 | Run fails with `dataset_url must be a Google Drive folder link` | `DATASET_URL` is empty or not a Drive **folder** link. Use the folder's Share link. |
 | Run fails listing/downloading the dataset | The Drive folder isn't shared with the service-account email, or `GDRIVE_SA_KEY` is wrong. See [setup.md](setup.md#2c-share-the-folder-with-the-service-account). |
 | Report link shows **404** | GitHub Pages isn't enabled (or the `gh-pages` branch doesn't exist yet on a fresh clone). See [setup.md → Troubleshooting](setup.md#troubleshooting). |

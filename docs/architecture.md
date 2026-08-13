@@ -13,22 +13,22 @@ Developer-facing overview of how the pipeline works.
 | `.github/workflows/build-image.yml` | Builds and pushes that image to GHCR. |
 | `training_config.yml` | Hyperparameters (epochs, imgsz, batch, patience, base model). |
 
-The animal-specific configuration is **not** in the code: classes come from the
-`CLASSES` repo variable, the dataset from `DATASET_URL`, credentials from secrets.
+The animal-specific configuration is **not** in the code: classes are derived from the
+dataset's folder names, the dataset from `DATASET_URL`, credentials from secrets.
 
 ## Flow of one run
 
 ```
 train.yml (GitHub Actions)
-  └─ POST /run to RunPod with { dataset_url, classes, drive_sa_b64, epochs, … }
+  └─ POST /run to RunPod with { dataset_url, drive_sa_b64, epochs, … }
        │
        ▼
 handler.py (RunPod Serverless GPU worker, a streaming generator)
-  1. parse CLASSES (first = target) → TARGET_CLASS / NON_TARGET_CLASS
+  1. derive classes from the train/ folders (the `the_` one = target) → TARGET_CLASS / NON_TARGET_CLASS
   2. mint a Drive token from the service-account JSON
   3. list the Drive folder, partition into train/val and test items
   4. download train/val to disk (parallel, authenticated)
-  5. drop corrupt images; assert dataset folders == CLASSES (fail fast otherwise)
+  5. drop corrupt images; require exactly one `the_` target folder (fail fast otherwise)
   6. downscale train images once (long side ≤ 1024)
   7. train YOLO11 classifier (Ultralytics), streaming epoch progress
   8. free training data from disk
@@ -97,8 +97,9 @@ ONNX metadata). The ONNX is what the local Rust sorter consumes.
 
 - **Changing `handler.py` or the `Dockerfile` requires rebuilding the worker image**
   (Build & Push Docker Image), or the endpoint runs stale code.
-- `CLASSES` must match the dataset's class folders exactly; the worker asserts this
-  before training and fails the job otherwise.
-- The target class is `CLASSES[0]` and must be one of the trained classes.
+- Classes are read from the dataset's `train/` subfolders. Exactly one must be prefixed
+  `the_` (the target); the worker fails the job otherwise.
+- The target class is the `the_`-prefixed folder (e.g. `the_manta` → target `manta`); the
+  rest are merged into non-target for the report.
 - `RELEASE_GITHUB_TOKEN` needs **Contents: write** for both Releases and `gh-pages`.
 - Report not visible ⇒ GitHub Pages not enabled on `gh-pages` (one-time setting).
