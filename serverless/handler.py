@@ -476,9 +476,12 @@ def _gh_headers(token: str) -> dict:
 
 
 def _export_onnx(model_path: str, imgsz: int) -> str:
-    """Export the trained .pt to ONNX (class names + imgsz embedded in metadata)."""
+    """Export the trained .pt to ONNX with a dynamic batch axis, so a consumer (e.g. RunML)
+    can score several images in one forward pass. Class names + imgsz are embedded in the
+    ONNX metadata.
+    """
     from ultralytics import YOLO
-    return str(YOLO(model_path).export(format="onnx", imgsz=imgsz))
+    return str(YOLO(model_path).export(format="onnx", imgsz=imgsz, dynamic=True))
 
 
 def create_github_release(model_path: str, token: str, repo: str, tag: str, imgsz: int = 640) -> str:
