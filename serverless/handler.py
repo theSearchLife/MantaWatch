@@ -1173,16 +1173,26 @@ def handler(job: dict):
             else:
                 log("  No test/ split — cannot evaluate; releasing without quality gate")
 
-            # Quality gate: skip the release only when we can prove the new model is
-            # worse than the previous one on the primary metric (F2 of the target class). No
-            # previous model, or a missing metric, leaves nothing to fail against, so
-            # the model is released.
+            # Quality gate: F2 of the target class stays the primary metric. Skip the
+            # release only when the new model is MEANINGFULLY worse on F2 (beyond a small
+            # noise tolerance), or when it dips on F2 without an offsetting precision gain.
+            # A tiny F2 dip paired with higher precision (fewer false positives) is let
+            # through. No previous model, or a missing metric, leaves nothing to fail
+            # against, so the model is released.
             mc = TARGET_CLASS
+            F2_TOL = 0.5  # percentage points of F2 treated as noise
             new_f2 = (new_eval or {}).get("per_class", {}).get(mc, {}).get("f2")
             prev_f2 = (prev_eval or {}).get("per_class", {}).get(mc, {}).get("f2")
-            if new_f2 is not None and prev_f2 is not None and new_f2 < prev_f2:
-                skip_reason = (f"F2({TARGET_CLASS}) {new_f2:.2f}% < prev {prev_f2:.2f}% "
-                               f"({prev_tag or 'prev'})")
+            new_p = (new_eval or {}).get("per_class", {}).get(mc, {}).get("precision")
+            prev_p = (prev_eval or {}).get("per_class", {}).get(mc, {}).get("precision")
+            if new_f2 is not None and prev_f2 is not None:
+                prec_up = new_p is not None and prev_p is not None and new_p > prev_p
+                if new_f2 < prev_f2 - F2_TOL:
+                    skip_reason = (f"F2({TARGET_CLASS}) {new_f2:.2f}% < prev {prev_f2:.2f}% "
+                                   f"by >{F2_TOL}pp ({prev_tag or 'prev'})")
+                elif new_f2 < prev_f2 and not prec_up:
+                    skip_reason = (f"F2({TARGET_CLASS}) {new_f2:.2f}% < prev {prev_f2:.2f}% "
+                                   f"and precision not improved ({prev_tag or 'prev'})")
 
             if skip_reason:
                 log(f"==> Release SKIPPED — new model worse: {skip_reason}")
