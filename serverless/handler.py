@@ -1173,26 +1173,32 @@ def handler(job: dict):
             else:
                 log("  No test/ split — cannot evaluate; releasing without quality gate")
 
-            # Quality gate: F2 of the target class stays the primary metric. Skip the
-            # release only when the new model is MEANINGFULLY worse on F2 (beyond a small
-            # noise tolerance), or when it dips on F2 without an offsetting precision gain.
-            # A tiny F2 dip paired with higher precision (fewer false positives) is let
-            # through. No previous model, or a missing metric, leaves nothing to fail
-            # against, so the model is released.
+            # Quality gate. F2 of the target class is the primary metric, but it is
+            # compared against a previous model whose recall can be inflated by train/test
+            # leakage (an old baseline trained on frames that later became test mantas),
+            # which makes a raw F2 comparison punish a genuinely better model. So: skip the
+            # release only when the new model loses more than F2_TOL on F2, OR when it dips
+            # on F2 without being clearly better on balance (both precision AND F1 up). A
+            # sub-F2_TOL F2 dip on a model that improves precision and F1 — fewer false
+            # positives, better overall — is released. No previous model, or a missing
+            # metric, leaves nothing to fail against, so the model is released.
             mc = TARGET_CLASS
-            F2_TOL = 0.5  # percentage points of F2 treated as noise
+            F2_TOL = 1.0  # pp of F2 tolerated as noise/leakage give-back, only when precision & F1 also improve
             new_f2 = (new_eval or {}).get("per_class", {}).get(mc, {}).get("f2")
             prev_f2 = (prev_eval or {}).get("per_class", {}).get(mc, {}).get("f2")
             new_p = (new_eval or {}).get("per_class", {}).get(mc, {}).get("precision")
             prev_p = (prev_eval or {}).get("per_class", {}).get(mc, {}).get("precision")
+            new_f1 = (new_eval or {}).get("per_class", {}).get(mc, {}).get("f1")
+            prev_f1 = (prev_eval or {}).get("per_class", {}).get(mc, {}).get("f1")
             if new_f2 is not None and prev_f2 is not None:
-                prec_up = new_p is not None and prev_p is not None and new_p > prev_p
+                better_balance = (new_p is not None and prev_p is not None and new_p > prev_p
+                                  and new_f1 is not None and prev_f1 is not None and new_f1 > prev_f1)
                 if new_f2 < prev_f2 - F2_TOL:
                     skip_reason = (f"F2({TARGET_CLASS}) {new_f2:.2f}% < prev {prev_f2:.2f}% "
                                    f"by >{F2_TOL}pp ({prev_tag or 'prev'})")
-                elif new_f2 < prev_f2 and not prec_up:
+                elif new_f2 < prev_f2 and not better_balance:
                     skip_reason = (f"F2({TARGET_CLASS}) {new_f2:.2f}% < prev {prev_f2:.2f}% "
-                                   f"and precision not improved ({prev_tag or 'prev'})")
+                                   f"without a precision+F1 gain ({prev_tag or 'prev'})")
 
             if skip_reason:
                 log(f"==> Release SKIPPED — new model worse: {skip_reason}")
