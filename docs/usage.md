@@ -80,8 +80,9 @@ Open the running workflow to see live logs. Key lines:
 | `🚀 Creating GitHub release...` | The model passed the gate and is being released. |
 | `✅ Training completed successfully.` | Done — with links to the Release and Report. |
 
-If the new model is **worse** than the previous one, you'll instead see a `Release SKIPPED`
-note — the report is still published so you can see why.
+If the new model doesn't pass the quality gate — a clear regression on **F2 of the target
+class** — you'll instead see a `Release SKIPPED` note, with the report still published so
+you can see why.
 
 ![Training run log with Release and Report links](imgs/img12.png)
 
@@ -127,6 +128,6 @@ two files:
 | Run fails with `dataset_url must be a Google Drive folder link` | `DATASET_URL` is empty or not a Drive **folder** link. Use the folder's Share link. |
 | Run fails listing/downloading the dataset | The Drive folder isn't shared with the service-account email, or `GDRIVE_SA_KEY` is wrong. See [setup.md](setup.md#2c-share-the-folder-with-the-service-account). |
 | Report link shows **404** | GitHub Pages isn't enabled (or the `gh-pages` branch doesn't exist yet on a fresh clone). See [setup.md → Troubleshooting](setup.md#troubleshooting). |
-| `Release SKIPPED — new model worse` | Working as intended: the new model scored lower F2 on the target class, so it wasn't released. The report shows the comparison. |
+| `Release SKIPPED — new model worse` | Working as intended: the new model regressed on F2 of the target class beyond the tolerance (or dipped on F2 without improving both precision and F1), so it wasn't released. The report shows the comparison. |
 | Endpoint never starts / job stuck in queue | No GPU available or the worker image isn't reachable. Check the RunPod endpoint (image public? GPU in stock?). |
-| Code change didn't take effect | Rebuild and push the worker image (**Build & Push Docker Image**); the endpoint runs the last-built image. |
+| Code change didn't take effect | Two steps are needed: **(1)** rebuild the worker image (**Actions → Build & Push Docker Image**), then **(2)** force the RunPod endpoint to re-pull it — Serverless → your endpoint → **Manage → Edit Endpoint → Save**. RunPod caches the `:latest` tag on warm workers and won't pull a new build on its own, so skipping step 2 leaves the old code running. |

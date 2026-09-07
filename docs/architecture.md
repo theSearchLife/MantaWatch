@@ -34,8 +34,8 @@ handler.py (RunPod Serverless GPU worker, a streaming generator)
   8. free training data from disk
   9. download the test split; evaluate the NEW model
  10. fetch the previous released model; evaluate it on the same test set
- 11. quality gate: compare F2(target); decide release vs skip
- 12. if not worse → create GitHub Release (model.pt + model.onnx)
+ 11. quality gate: compare F2(target), with a precision/F1 tolerance; decide release vs skip
+ 12. if it passes the gate → create GitHub Release (model.pt + model.onnx)
  13. publish the comparison report to gh-pages (always)
  14. yield the final result dict
 ```
@@ -71,9 +71,14 @@ class** (recall-weighted: missing the target costs more than a false alarm). The
 report shows the new vs previous model with a single go/no-go verdict.
 
 **Releases are gated.** The worker evaluates the new model *and* the previous released
-model on the same test set, and **skips the release if the new model's F2(target) is
-worse**. If there's no previous model, or eval can't run, it releases (nothing to fail
-against). The report is published either way so a rejection is visible with its reason.
+model on the same test set. F2(target) is the primary metric, but it's compared against a
+previous model whose recall can be inflated by train/test leakage (an old baseline trained
+on frames that later became test images), so a raw F2 comparison would punish a genuinely
+better model. The gate therefore **skips the release only when F2(target) drops by more
+than ~1 pp, or when it dips at all without an accompanying gain in both precision and F1** —
+a better-balanced model (fewer false positives) is allowed through a sub-1 pp F2 dip. If
+there's no previous model, or eval can't run, it releases (nothing to fail against). The
+report is published either way so a rejection is visible with its reason.
 
 **Two model formats per release.** `model.pt` (Ultralytics/PyTorch) and `model.onnx`
 (exported via `model.export(format="onnx")`, with class names + imgsz embedded in the

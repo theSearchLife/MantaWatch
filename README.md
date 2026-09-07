@@ -3,7 +3,7 @@
 Automated image-classification training pipeline. Trigger one GitHub Action and a GPU
 worker (RunPod Serverless) trains a [YOLO11](https://docs.ultralytics.com/tasks/classify/)
 classifier on images from a Google Drive folder, evaluates it against the previous model,
-publishes a visual report, and — only if the new model is not worse — releases it.
+publishes a visual report, and — unless the new model is a clear regression — releases it.
 
 It's generic: the classes come from your dataset's folder names, so the same pipeline
 retrains on any animal without code changes (currently configured for **manta rays**).

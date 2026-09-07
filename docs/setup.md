@@ -99,6 +99,10 @@ my-dataset/                ← this folder's link becomes DATASET_URL
 There's no classes variable to set. The report becomes "manta vs non_manta" (the target vs
 everything else), scored by F2 of the target.
 
+The class count is flexible: use as few as **two** — one `the_` target plus a single rest
+folder (e.g. `the_manta` + `non_manta`) — or add more `other_`/`non_` folders. The pipeline
+reads whatever the dataset contains.
+
 ### 2b. Service account + key → secret `GDRIVE_SA_KEY`
 
 A **service account** is a "robot" Google account the worker logs in as to download the
